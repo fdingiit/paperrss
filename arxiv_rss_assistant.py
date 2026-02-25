@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import sys
 import time
 from html import unescape
 import urllib.parse
@@ -24,16 +25,32 @@ from urllib.error import HTTPError
 import xml.etree.ElementTree as ET
 from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+import paperrss_version
+
 logger = logging.getLogger("paperrss.rss")
+APP_VERSION = paperrss_version.get_version()
 
 
 def setup_logging(log_level: str = "INFO", log_file: str | None = None) -> None:
     level = getattr(logging, log_level.upper(), logging.INFO)
-    handlers: list[logging.Handler] = [logging.StreamHandler()]
+
+    class MaxLevelFilter(logging.Filter):
+        def __init__(self, max_level: int) -> None:
+            super().__init__()
+            self.max_level = max_level
+
+        def filter(self, record: logging.LogRecord) -> bool:
+            return record.levelno <= self.max_level
+
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.addFilter(MaxLevelFilter(logging.INFO))
+    stderr_handler = logging.StreamHandler(sys.stderr)
+    stderr_handler.setLevel(logging.WARNING)
+    handlers: list[logging.Handler] = [stdout_handler, stderr_handler]
     if log_file:
         Path(log_file).parent.mkdir(parents=True, exist_ok=True)
         handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
@@ -423,6 +440,72 @@ def save_state(path: Path, state: dict) -> None:
     path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def load_subscription_store(path: Path) -> dict:
+    if not path.exists():
+        return {"seen_ids": []}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {"seen_ids": []}
+    if not isinstance(data, dict):
+        return {"seen_ids": []}
+    return {"seen_ids": list(data.get("seen_ids", []))}
+
+
+def save_subscription_store(path: Path, seen_ids: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"seen_ids": seen_ids}, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_push_state(path: Path) -> dict:
+    if not path.exists():
+        return {"pushed_by_date": {}, "pushed_report_dates": [], "pushed_paper_ids": []}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {"pushed_by_date": {}, "pushed_report_dates": [], "pushed_paper_ids": []}
+    if not isinstance(data, dict):
+        return {"pushed_by_date": {}, "pushed_report_dates": [], "pushed_paper_ids": []}
+    return {
+        "pushed_by_date": dict(data.get("pushed_by_date", {})),
+        "pushed_paper_ids": list(data.get("pushed_paper_ids", [])),
+        "pushed_report_dates": list(data.get("pushed_report_dates", [])),
+    }
+
+
+def save_push_state(path: Path, pushed_by_date: dict[str, list[str]], pushed_report_dates: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "pushed_by_date": pushed_by_date,
+                "pushed_report_dates": pushed_report_dates,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+def prune_pushed_by_date(
+    pushed_by_date: dict[str, set[str]],
+    today_str: str,
+    retention_days: int,
+) -> dict[str, set[str]]:
+    keep_after = datetime.strptime(today_str, "%Y-%m-%d") - timedelta(days=max(0, retention_days - 1))
+    out: dict[str, set[str]] = {}
+    for date_key, ids in pushed_by_date.items():
+        try:
+            d = datetime.strptime(date_key, "%Y-%m-%d")
+        except ValueError:
+            continue
+        if d >= keep_after:
+            out[date_key] = ids
+    return out
+
+
 def load_config(path: Path) -> dict:
     if not path.exists():
         return {}
@@ -723,6 +806,7 @@ def post_to_slack(
     max_retries: int = 4,
     workers: int = 4,
     preserve_order: bool = True,
+    on_message_sent: Any = None,
 ) -> tuple[int, int, str | None]:
     def send_one(idx: int, message: dict[str, Any]) -> tuple[int, bool, str | None]:
         payload = json.dumps(message, ensure_ascii=False).encode("utf-8")
@@ -770,6 +854,11 @@ def post_to_slack(
         _, ok, err = send_one(idx, msg)
         if ok:
             sent += 1
+            if callable(on_message_sent):
+                try:
+                    on_message_sent(idx, msg)
+                except Exception:  # noqa: BLE001
+                    logger.exception("slack_push_sent_callback_error index=%s", idx)
         else:
             failed += 1
             if first_error is None:
@@ -781,16 +870,36 @@ def post_to_slack(
 
 
 def run(args: argparse.Namespace) -> int:
+    logger.info("app_version=%s", APP_VERSION)
     now = datetime.now(timezone.utc)
     today_str = now.strftime("%Y-%m-%d")
     config = load_config(Path(args.config))
     state_path = Path(args.state)
+    subscription_store_path = Path(
+        args.subscription_store or config.get("subscription_store", "storage/data/subscriptions.json")
+    )
+    push_state_path = Path(args.push_state or config.get("push_state", "storage/data/push_state.json"))
     output_dir = Path(args.output_dir)
 
     state = load_state(state_path)
+    subscription_store = load_subscription_store(subscription_store_path)
+    push_state = load_push_state(push_state_path)
     last_run_raw = state.get("last_run")
     last_run = parse_dt(last_run_raw) if last_run_raw else None
-    seen_ids: set[str] = set(state.get("seen_ids", []))
+    seen_ids: set[str] = set(state.get("seen_ids", [])) | set(subscription_store.get("seen_ids", []))
+    push_state_retention_days = int(config.get("push_state_retention_days", 14))
+    pushed_by_date_raw = push_state.get("pushed_by_date", {}) or {}
+    pushed_by_date: dict[str, set[str]] = {
+        str(k): set(v if isinstance(v, list) else [])
+        for k, v in pushed_by_date_raw.items()
+    }
+    # Backward compatibility with old flat format.
+    legacy_ids = set(push_state.get("pushed_paper_ids", []))
+    if legacy_ids:
+        pushed_by_date.setdefault(today_str, set()).update(legacy_ids)
+    pushed_by_date = prune_pushed_by_date(pushed_by_date, today_str, push_state_retention_days)
+    pushed_paper_ids: set[str] = set().union(*pushed_by_date.values()) if pushed_by_date else set()
+    pushed_report_dates: set[str] = set(push_state.get("pushed_report_dates", []))
 
     try:
         papers = fetch_papers(args.categories, args.max_results, args.feed_file)
@@ -833,7 +942,7 @@ def run(args: argparse.Namespace) -> int:
         if args.author_enrich is not None
         else parse_bool(config.get("author_enrich", True), default=True)
     )
-    author_cache_path = Path(args.author_cache or config.get("author_cache", "data/author_cache.json"))
+    author_cache_path = Path(args.author_cache or config.get("author_cache", "storage/data/author_cache.json"))
     author_enrich_max_papers = int(config.get("author_enrich_max_papers", 60))
     author_enrich_timeout = int(config.get("author_enrich_timeout_seconds", 8))
     author_enrich_workers = int(config.get("author_enrich_workers", 8))
@@ -887,16 +996,60 @@ def run(args: argparse.Namespace) -> int:
     if not preserve_existing_report:
         render_report(report_path, now, len(new_rows), ranked_rows)
 
+    # Push dedupe: avoid re-sending already pushed papers on restart/redeploy.
+    ranked_rows_for_push = ranked_rows
+    if not force_push:
+        ranked_rows_for_push = [row for row in ranked_rows if row[0].paper_id not in pushed_paper_ids]
+    dedup_filtered = len(ranked_rows) - len(ranked_rows_for_push)
+    logger.info(
+        "push_dedupe total_ranked=%s filtered_already_pushed=%s remaining=%s",
+        len(ranked_rows),
+        dedup_filtered,
+        len(ranked_rows_for_push),
+    )
+
     should_send_slack = bool(webhook_url) and (
         force_push
         or slack_when == "any"
         or (slack_when == "relevant" and len(relevant_rows) > 0)
     )
+    if not force_push and len(ranked_rows_for_push) == 0:
+        should_send_slack = False
+        logger.info("push_dedupe_skip reason=no_new_rows_after_dedupe")
+    if not force_push and today_str in pushed_report_dates and len(ranked_rows_for_push) == 0:
+        should_send_slack = False
+        logger.info("push_dedupe_skip reason=report_already_pushed_today date=%s", today_str)
+
     if should_send_slack:
         if force_push_existing_report:
             slack_messages = build_slack_messages_from_report(report_path)
         else:
-            slack_messages = build_slack_messages(now, len(new_rows), ranked_rows, report_path)
+            slack_messages = build_slack_messages(now, len(new_rows), ranked_rows_for_push, report_path)
+        paper_id_by_message_index: dict[int, str] = {}
+        if not force_push_existing_report:
+            # Message index 1 is the overview message; paper cards start from index 2.
+            for i, (paper, _) in enumerate(ranked_rows_for_push, start=2):
+                paper_id_by_message_index[i] = paper.paper_id
+
+        def on_message_sent(idx: int, _msg: dict[str, Any]) -> None:
+            # Persist push state incrementally to survive mid-run failures/restarts.
+            pushed_report_dates.add(today_str)
+            paper_id = paper_id_by_message_index.get(idx)
+            if paper_id:
+                pushed_by_date.setdefault(today_str, set()).add(paper_id)
+                pushed_paper_ids.add(paper_id)
+            pruned = prune_pushed_by_date(pushed_by_date, today_str, push_state_retention_days)
+            save_push_state(
+                push_state_path,
+                {k: sorted(v) for k, v in sorted(pruned.items())},
+                sorted(pushed_report_dates)[-365:],
+            )
+            logger.info(
+                "push_state_incremental_saved msg_index=%s paper_id=%s report_date=%s",
+                idx,
+                paper_id,
+                today_str,
+            )
         try:
             sent_count, fail_count, first_error = post_to_slack(
                 webhook_url,
@@ -905,6 +1058,7 @@ def run(args: argparse.Namespace) -> int:
                 max_retries=int(config.get("slack_max_retries", 4)),
                 workers=int(config.get("slack_push_workers", 4)),
                 preserve_order=parse_bool(config.get("slack_preserve_order", True), default=True),
+                on_message_sent=on_message_sent,
             )
             if fail_count == 0:
                 slack_status = f"sent({sent_count})"
@@ -924,6 +1078,13 @@ def run(args: argparse.Namespace) -> int:
         "seen_ids": trimmed_seen,
     }
     save_state(state_path, new_state)
+    save_subscription_store(subscription_store_path, trimmed_seen)
+    pushed_by_date = prune_pushed_by_date(pushed_by_date, today_str, push_state_retention_days)
+    save_push_state(
+        push_state_path,
+        {k: sorted(v) for k, v in sorted(pushed_by_date.items())},
+        sorted(pushed_report_dates)[-365:],
+    )
 
     force_push_mode = (
         "existing_report" if force_push_existing_report else
@@ -931,11 +1092,13 @@ def run(args: argparse.Namespace) -> int:
         "off"
     )
     logger.info(
-        "scan_completed new_scanned=%s relevant=%s report=%s state=%s slack=%s force_push_mode=%s sort_priority=%s author_enrich=%s max_author_papers=%s",
+        "scan_completed new_scanned=%s relevant=%s report=%s state=%s subscription_store=%s push_state=%s slack=%s force_push_mode=%s sort_priority=%s author_enrich=%s max_author_papers=%s",
         len(new_rows),
         len(relevant_rows),
         report_path,
         state_path,
+        subscription_store_path,
+        push_state_path,
         slack_status,
         force_push_mode,
         sort_priority,
@@ -947,6 +1110,7 @@ def run(args: argparse.Namespace) -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Incremental arXiv RSS assistant")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {APP_VERSION}")
     parser.add_argument("--config", default="config.json", help="Path to JSON config file")
     parser.add_argument(
         "--categories",
@@ -955,8 +1119,10 @@ def parse_args() -> argparse.Namespace:
         help="arXiv categories to query (default: cs.LG cs.AI cs.CL cs.DC stat.ML)",
     )
     parser.add_argument("--max-results", type=int, default=250, help="Max results fetched from arXiv API")
-    parser.add_argument("--state", default="data/state.json", help="Path to local state JSON")
-    parser.add_argument("--output-dir", default="reports", help="Directory for generated markdown reports")
+    parser.add_argument("--state", default="storage/data/state.json", help="Path to local state JSON")
+    parser.add_argument("--subscription-store", default=None, help="Path to subscription seen-id store JSON")
+    parser.add_argument("--push-state", default=None, help="Path to push dedupe state JSON")
+    parser.add_argument("--output-dir", default="storage/reports", help="Directory for generated markdown reports")
     parser.add_argument(
         "--feed-file",
         default=None,

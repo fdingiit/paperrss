@@ -35,8 +35,11 @@ cp /Users/fd/Lab/paperrss/config.example.json /Users/fd/Lab/paperrss/config.json
 - `slack_preserve_order`：是否按 ranking 顺序推送（默认 `true`，当前实现按序串行推送）
 - `sort_priority`：排序策略，默认 `inference_acceleration`（最高优先级：推理加速）
 - `classify_workers`：分类阶段并发 worker 数（默认 `8`）
+- `subscription_store`：订阅历史持久化（已见论文 ID，默认 `storage/data/subscriptions.json`）
+- `push_state`：推送去重持久化（已推论文/已推报告日期，默认 `storage/data/push_state.json`）
+- `push_state_retention_days`：推送去重保留天数（默认 `14`，按日期分桶自动裁剪）
 - `author_enrich`：是否从 arXiv HTML 抓作者邮箱，默认 `true`
-- `author_cache`：作者线索缓存文件，默认 `data/author_cache.json`
+- `author_cache`：作者线索缓存文件，默认 `storage/data/author_cache.json`
 - `author_enrich_max_papers`：单次最多增强多少篇（默认 `60`，避免阻塞推送）
 - `author_enrich_timeout_seconds`：单篇作者抓取超时秒数（默认 `8`）
 - `author_enrich_workers`：作者增强并发 worker 数（默认 `8`）
@@ -75,6 +78,12 @@ Slack App 需要这些 scope：
 - `@bot -force`：清空当日 state/report 并立即全量重跑当日任务
 
 默认在 thread 内回复，避免刷屏。
+
+存储目录建议：
+- 统一使用 `storage/` 作为持久化根目录
+- `storage/data/`：状态与缓存
+- `storage/reports/`：日报文件
+- Docker/NAS 只需挂载一个 volume 到 `/app/storage`
 
 ## 设计说明（toolkit）
 

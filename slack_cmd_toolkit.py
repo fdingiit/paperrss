@@ -12,18 +12,34 @@ import argparse
 import json
 import logging
 import re
+import sys
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+import paperrss_version
 import slack_healthcheck
 
 logger = logging.getLogger("paperrss.cmd")
+APP_VERSION = paperrss_version.get_version()
 
 
 def setup_logging(log_level: str = "INFO", log_file: str | None = None) -> None:
     level = getattr(logging, log_level.upper(), logging.INFO)
-    handlers: list[logging.Handler] = [logging.StreamHandler()]
+
+    class MaxLevelFilter(logging.Filter):
+        def __init__(self, max_level: int) -> None:
+            super().__init__()
+            self.max_level = max_level
+
+        def filter(self, record: logging.LogRecord) -> bool:
+            return record.levelno <= self.max_level
+
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.addFilter(MaxLevelFilter(logging.INFO))
+    stderr_handler = logging.StreamHandler(sys.stderr)
+    stderr_handler.setLevel(logging.WARNING)
+    handlers: list[logging.Handler] = [stdout_handler, stderr_handler]
     if log_file:
         Path(log_file).parent.mkdir(parents=True, exist_ok=True)
         handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
@@ -230,9 +246,20 @@ def build_command_response(command: str, health_url: str | None, report_dir: str
             return {"text": f"pong (health check failed: {exc})"}
     if command == "-help":
         return {
-            "text": "Supported commands: -ping, -brief, -force, -help",
+            "text": f"LLMRssBot v{APP_VERSION} | commands: -ping -brief -force -help",
             "blocks": [
                 {"type": "header", "text": {"type": "plain_text", "text": "LLMRssBot Commands"}},
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": (
+                            "*Capabilities*\n"
+                            "I monitor arXiv daily for LLM training/inference/infrastructure papers, "
+                            "push ranked rich-format updates to Slack, and support ops/debug commands."
+                        ),
+                    },
+                },
                 {
                     "type": "section",
                     "text": {
@@ -244,6 +271,18 @@ def build_command_response(command: str, health_url: str | None, report_dir: str
                             "`-help` show commands"
                         ),
                     },
+                },
+                {
+                    "type": "context",
+                    "elements": [
+                        {
+                            "type": "mrkdwn",
+                            "text": (
+                                "Usage: `@LLMRssBot -ping` / `@LLMRssBot -brief` / `@LLMRssBot -force`"
+                                f"  |  version: `v{APP_VERSION}`"
+                            ),
+                        }
+                    ],
                 },
             ],
         }
@@ -296,6 +335,7 @@ def process_batch(
 
 
 def run(args: argparse.Namespace) -> int:
+    logger.info("app_version=%s", APP_VERSION)
     config = load_json(Path(args.config))
     token = args.bot_token or config.get("slack_bot_token")
     channel_id = args.channel_id or config.get("slack_channel_id")
@@ -341,6 +381,7 @@ def run(args: argparse.Namespace) -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Slack command toolkit")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {APP_VERSION}")
     parser.add_argument("--config", default="config.json", help="Path to JSON config")
     parser.add_argument("--bot-token", default=None, help="Slack bot token xoxb-...")
     parser.add_argument("--channel-id", default=None, help="Slack channel ID")

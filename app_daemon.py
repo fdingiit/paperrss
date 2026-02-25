@@ -7,6 +7,7 @@ import argparse
 import collections
 import json
 import logging
+import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -16,15 +17,30 @@ from types import SimpleNamespace
 from typing import Any
 
 import arxiv_rss_assistant
+import paperrss_version
 import slack_cmd_toolkit
 import slack_healthcheck
 
 logger = logging.getLogger("paperrss.daemon")
+APP_VERSION = paperrss_version.get_version()
 
 
 def setup_logging(log_level: str = "INFO", log_file: str | None = None) -> None:
     level = getattr(logging, log_level.upper(), logging.INFO)
-    handlers: list[logging.Handler] = [logging.StreamHandler()]
+
+    class MaxLevelFilter(logging.Filter):
+        def __init__(self, max_level: int) -> None:
+            super().__init__()
+            self.max_level = max_level
+
+        def filter(self, record: logging.LogRecord) -> bool:
+            return record.levelno <= self.max_level
+
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.addFilter(MaxLevelFilter(logging.INFO))
+    stderr_handler = logging.StreamHandler(sys.stderr)
+    stderr_handler.setLevel(logging.WARNING)
+    handlers: list[logging.Handler] = [stdout_handler, stderr_handler]
     if log_file:
         Path(log_file).parent.mkdir(parents=True, exist_ok=True)
         handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
@@ -115,8 +131,10 @@ def build_rss_args(config_path: str, config: dict, force_push: bool = False) -> 
         config=config_path,
         categories=config.get("rss_categories", arxiv_rss_assistant.DEFAULT_CATEGORIES),
         max_results=int(config.get("rss_max_results", 250)),
-        state=config.get("rss_state", "data/state.json"),
-        output_dir=config.get("rss_output_dir", "reports"),
+        state=config.get("rss_state", "storage/data/state.json"),
+        subscription_store=config.get("subscription_store", "storage/data/subscriptions.json"),
+        push_state=config.get("push_state", "storage/data/push_state.json"),
+        output_dir=config.get("rss_output_dir", "storage/reports"),
         feed_file=config.get("rss_feed_file"),
         slack_webhook_url=config.get("slack_webhook_url"),
         slack_when=config.get("slack_when"),
@@ -124,7 +142,7 @@ def build_rss_args(config_path: str, config: dict, force_push: bool = False) -> 
         sort_priority=config.get("sort_priority"),
         classify_workers=int(config.get("classify_workers", 8)),
         author_enrich=parse_bool(config.get("author_enrich", True), default=True),
-        author_cache=config.get("author_cache", "data/author_cache.json"),
+        author_cache=config.get("author_cache", "storage/data/author_cache.json"),
         log_level="INFO",
         log_file=None,
     )
@@ -184,7 +202,7 @@ def socket_mode_loop(
     app_token = config.get("slack_app_token")
     health_url = f"http://{config.get('health_host', '127.0.0.1')}:{int(config.get('health_port', 8080))}/healthz"
     reply_in_thread = parse_bool(config.get("cmd_reply_in_thread", True), default=True)
-    report_dir = str(config.get("rss_output_dir", "reports"))
+    report_dir = str(config.get("rss_output_dir", "storage/reports"))
 
     if not bot_token or not app_token:
         logger.warning("socket_mode_disabled missing slack_bot_token or slack_app_token")
@@ -274,6 +292,12 @@ def socket_mode_loop(
                     logger.info("cmd_socket_mention_ignored text=%s", text[:120])
                     continue
                 if command == "-force":
+                    channel = event.get("channel")
+                    ts = event.get("ts")
+                    if not channel:
+                        logger.warning("cmd_socket_missing_channel event=%s", event)
+                        continue
+
                     if rss_run_lock.locked():
                         response = {
                             "text": "force rerun skipped: RSS task already running",
@@ -283,56 +307,85 @@ def socket_mode_loop(
                             ],
                         }
                     else:
-                        state_path = Path(config.get("rss_state", "data/state.json"))
-                        report_path = Path(config.get("rss_output_dir", "reports")) / (
+                        state_path = Path(config.get("rss_state", "storage/data/state.json"))
+                        report_path = Path(config.get("rss_output_dir", "storage/reports")) / (
                             datetime.now(timezone.utc).strftime("%Y-%m-%d") + ".md"
                         )
-                        removed_state = False
-                        removed_report = False
-                        try:
-                            if state_path.exists():
-                                state_path.unlink()
-                                removed_state = True
-                            if report_path.exists():
-                                report_path.unlink()
-                                removed_report = True
-                            logger.info(
-                                "cmd_force_cleanup_done removed_state=%s removed_report=%s state=%s report=%s",
-                                removed_state,
-                                removed_report,
-                                state_path,
-                                report_path,
-                            )
-                            with rss_run_lock:
-                                args = build_rss_args(config_path, config, force_push=True)
-                                code = arxiv_rss_assistant.run(args)
-                            app_state.update(
-                                "rss",
-                                {
-                                    "last_run_at": now_utc_iso(),
-                                    "last_status": "ok" if code == 0 else "error",
-                                    "last_error": None if code == 0 else f"exit_code={code}",
-                                },
-                            )
-                            status = "ok" if code == 0 else f"error(exit_code={code})"
-                            response = {
-                                "text": f"force rerun completed: {status}",
-                                "blocks": [
-                                    {"type": "header", "text": {"type": "plain_text", "text": "Force Rerun"}},
+                        reply_thread_ts = event.get("thread_ts") or ts
+
+                        def run_force_task() -> None:
+                            removed_state = False
+                            removed_report = False
+                            try:
+                                with rss_run_lock:
+                                    if state_path.exists():
+                                        state_path.unlink()
+                                        removed_state = True
+                                    if report_path.exists():
+                                        report_path.unlink()
+                                        removed_report = True
+                                    logger.info(
+                                        "cmd_force_cleanup_done removed_state=%s removed_report=%s state=%s report=%s",
+                                        removed_state,
+                                        removed_report,
+                                        state_path,
+                                        report_path,
+                                    )
+                                    args = build_rss_args(config_path, config, force_push=True)
+                                    code = arxiv_rss_assistant.run(args)
+
+                                app_state.update(
+                                    "rss",
                                     {
-                                        "type": "section",
-                                        "fields": [
-                                            {"type": "mrkdwn", "text": f"*Status*\n{status}"},
-                                            {"type": "mrkdwn", "text": f"*Report*\n`{report_path}`"},
-                                            {"type": "mrkdwn", "text": f"*State reset*\n{removed_state}"},
-                                            {"type": "mrkdwn", "text": f"*Report reset*\n{removed_report}"},
-                                        ],
+                                        "last_run_at": now_utc_iso(),
+                                        "last_status": "ok" if code == 0 else "error",
+                                        "last_error": None if code == 0 else f"exit_code={code}",
                                     },
-                                ],
-                            }
-                        except Exception as exc:  # noqa: BLE001
-                            logger.exception("cmd_force_run_error")
-                            response = {"text": f"force rerun failed: {exc}"}
+                                )
+                                status = "ok" if code == 0 else f"error(exit_code={code})"
+                                done_payload = {
+                                    "channel": channel,
+                                    "text": f"force rerun completed: {status}",
+                                    "blocks": [
+                                        {"type": "header", "text": {"type": "plain_text", "text": "Force Rerun Done"}},
+                                        {
+                                            "type": "section",
+                                            "fields": [
+                                                {"type": "mrkdwn", "text": f"*Status*\n{status}"},
+                                                {"type": "mrkdwn", "text": f"*Report*\n`{report_path}`"},
+                                                {"type": "mrkdwn", "text": f"*State reset*\n{removed_state}"},
+                                                {"type": "mrkdwn", "text": f"*Report reset*\n{removed_report}"},
+                                            ],
+                                        },
+                                    ],
+                                }
+                            except Exception as exc:  # noqa: BLE001
+                                logger.exception("cmd_force_run_error")
+                                done_payload = {
+                                    "channel": channel,
+                                    "text": f"force rerun failed: {exc}",
+                                }
+                            if reply_in_thread and reply_thread_ts:
+                                done_payload["thread_ts"] = reply_thread_ts
+                            try:
+                                slack_healthcheck.slack_api_call(bot_token, "chat.postMessage", done_payload)
+                            except Exception:  # noqa: BLE001
+                                logger.exception("cmd_force_done_notify_error")
+
+                        threading.Thread(target=run_force_task, daemon=True).start()
+                        response = {
+                            "text": "force rerun started",
+                            "blocks": [
+                                {"type": "header", "text": {"type": "plain_text", "text": "Force Rerun"}},
+                                {
+                                    "type": "section",
+                                    "text": {
+                                        "type": "mrkdwn",
+                                        "text": "Task started in background. I will post a completion message when done.",
+                                    },
+                                },
+                            ],
+                        }
                 else:
                     response = slack_cmd_toolkit.build_command_response(command, health_url, report_dir=report_dir)
                 channel = event.get("channel")
@@ -400,6 +453,7 @@ def run(args: argparse.Namespace) -> int:
     log_level = str(config.get("log_level", args.log_level))
     log_file = config.get("log_file", args.log_file)
     setup_logging(log_level, log_file)
+    logger.info("app_version=%s", APP_VERSION)
 
     app_state = AppState()
     stop_event = threading.Event()
@@ -442,6 +496,7 @@ def run(args: argparse.Namespace) -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="paperrss resident daemon")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {APP_VERSION}")
     parser.add_argument("--config", default="config.json", help="Path to JSON config")
     parser.add_argument("--log-level", default="INFO", help="Logging level: DEBUG/INFO/WARN/ERROR")
     parser.add_argument("--log-file", default=None, help="Optional log file path")

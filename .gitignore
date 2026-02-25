@@ -1,0 +1,23 @@
+# Python cache/bytecode
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Local runtime/config artifacts
+config.json
+.venvrc
+logs/
+*.log
+
+# Generated runtime data/reports
+storage/
+
+# OS/editor noise
+.DS_Store
+.idea/
+.vscode/

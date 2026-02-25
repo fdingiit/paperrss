@@ -6,17 +6,34 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sys
 import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
+import paperrss_version
+
 logger = logging.getLogger("paperrss.healthcheck")
+APP_VERSION = paperrss_version.get_version()
 
 
 def setup_logging(log_level: str = "INFO", log_file: str | None = None) -> None:
     level = getattr(logging, log_level.upper(), logging.INFO)
-    handlers: list[logging.Handler] = [logging.StreamHandler()]
+
+    class MaxLevelFilter(logging.Filter):
+        def __init__(self, max_level: int) -> None:
+            super().__init__()
+            self.max_level = max_level
+
+        def filter(self, record: logging.LogRecord) -> bool:
+            return record.levelno <= self.max_level
+
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.addFilter(MaxLevelFilter(logging.INFO))
+    stderr_handler = logging.StreamHandler(sys.stderr)
+    stderr_handler.setLevel(logging.WARNING)
+    handlers: list[logging.Handler] = [stdout_handler, stderr_handler]
     if log_file:
         Path(log_file).parent.mkdir(parents=True, exist_ok=True)
         handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
@@ -90,6 +107,7 @@ def should_reply_ping(msg: dict, ping_text: str) -> bool:
 
 
 def run(args: argparse.Namespace) -> int:
+    logger.info("app_version=%s", APP_VERSION)
     config = load_json(Path(args.config))
     token = args.bot_token or config.get("slack_bot_token")
     channel_id = args.channel_id or config.get("slack_channel_id")
@@ -134,6 +152,7 @@ def run(args: argparse.Namespace) -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Slack ping/pong healthcheck bot")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {APP_VERSION}")
     parser.add_argument("--config", default="config.json", help="Path to JSON config")
     parser.add_argument("--bot-token", default=None, help="Slack Bot User OAuth Token (xoxb-...) ")
     parser.add_argument("--channel-id", default=None, help="Slack channel ID (e.g., C0123456789)")
