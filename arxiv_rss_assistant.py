@@ -30,35 +30,12 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import paperrss_version
+import paperrss_utils
 
 logger = logging.getLogger("paperrss.rss")
 APP_VERSION = paperrss_version.get_version()
 
-
-def setup_logging(log_level: str = "INFO", log_file: str | None = None) -> None:
-    level = getattr(logging, log_level.upper(), logging.INFO)
-
-    class MaxLevelFilter(logging.Filter):
-        def __init__(self, max_level: int) -> None:
-            super().__init__()
-            self.max_level = max_level
-
-        def filter(self, record: logging.LogRecord) -> bool:
-            return record.levelno <= self.max_level
-
-    stdout_handler = logging.StreamHandler(sys.stdout)
-    stdout_handler.addFilter(MaxLevelFilter(logging.INFO))
-    stderr_handler = logging.StreamHandler(sys.stderr)
-    stderr_handler.setLevel(logging.WARNING)
-    handlers: list[logging.Handler] = [stdout_handler, stderr_handler]
-    if log_file:
-        Path(log_file).parent.mkdir(parents=True, exist_ok=True)
-        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-        handlers=handlers,
-    )
+setup_logging = paperrss_utils.setup_logging
 
 
 ARXIV_API = "https://export.arxiv.org/api/query"
@@ -516,15 +493,11 @@ def load_config(path: Path) -> dict:
 
 
 def parse_bool(value: Any, default: bool = False) -> bool:
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return default
-    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+    return paperrss_utils.parse_bool(value, default)
 
 
 def strip_version(arxiv_id: str) -> str:
-    return re.sub(r"v\\d+$", "", arxiv_id)
+    return re.sub(r"v\d+$", "", arxiv_id)
 
 
 def extract_emails(text: str) -> list[str]:
@@ -804,8 +777,6 @@ def post_to_slack(
     timeout: int = 20,
     send_interval_seconds: float = 0.0,
     max_retries: int = 4,
-    workers: int = 4,
-    preserve_order: bool = True,
     on_message_sent: Any = None,
 ) -> tuple[int, int, str | None]:
     def send_one(idx: int, message: dict[str, Any]) -> tuple[int, bool, str | None]:
@@ -1056,8 +1027,6 @@ def run(args: argparse.Namespace) -> int:
                 slack_messages,
                 send_interval_seconds=float(config.get("slack_send_interval_seconds", 1.1)),
                 max_retries=int(config.get("slack_max_retries", 4)),
-                workers=int(config.get("slack_push_workers", 4)),
-                preserve_order=parse_bool(config.get("slack_preserve_order", True), default=True),
                 on_message_sent=on_message_sent,
             )
             if fail_count == 0:

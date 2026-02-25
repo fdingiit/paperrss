@@ -10,7 +10,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 RUN pip install --no-cache-dir websocket-client
 
 # App sources
-COPY app_daemon.py arxiv_rss_assistant.py slack_cmd_toolkit.py slack_healthcheck.py paperrss_version.py /app/
+COPY app_daemon.py arxiv_rss_assistant.py slack_cmd_toolkit.py slack_healthcheck.py paperrss_version.py paperrss_utils.py /app/
 COPY VERSION /app/VERSION
 COPY config.example.json README.md /app/
 COPY config.json /app/config.json
