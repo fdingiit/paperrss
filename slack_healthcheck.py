@@ -13,49 +13,14 @@ import urllib.request
 from pathlib import Path
 
 import paperrss_version
+import paperrss_utils
 
 logger = logging.getLogger("paperrss.healthcheck")
 APP_VERSION = paperrss_version.get_version()
 
-
-def setup_logging(log_level: str = "INFO", log_file: str | None = None) -> None:
-    level = getattr(logging, log_level.upper(), logging.INFO)
-
-    class MaxLevelFilter(logging.Filter):
-        def __init__(self, max_level: int) -> None:
-            super().__init__()
-            self.max_level = max_level
-
-        def filter(self, record: logging.LogRecord) -> bool:
-            return record.levelno <= self.max_level
-
-    stdout_handler = logging.StreamHandler(sys.stdout)
-    stdout_handler.addFilter(MaxLevelFilter(logging.INFO))
-    stderr_handler = logging.StreamHandler(sys.stderr)
-    stderr_handler.setLevel(logging.WARNING)
-    handlers: list[logging.Handler] = [stdout_handler, stderr_handler]
-    if log_file:
-        Path(log_file).parent.mkdir(parents=True, exist_ok=True)
-        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-        handlers=handlers,
-    )
-
-
-def load_json(path: Path) -> dict:
-    if not path.exists():
-        return {}
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return {}
-
-
-def save_json(path: Path, data: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+setup_logging = paperrss_utils.setup_logging
+load_json = paperrss_utils.load_json
+save_json = paperrss_utils.save_json
 
 
 def slack_api_call(token: str, method: str, params: dict | None = None) -> dict:
