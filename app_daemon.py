@@ -374,14 +374,6 @@ def build_weekly_synthesis_prompt(summary: dict[str, Any], interest_topics: list
             f"best_score={cluster.get('best_score', 0)}; samples={', '.join(cluster.get('sample_titles', [])[:3])}"
         )
     return "\n".join(lines)
-    lines.append("")
-    lines.append("Theme clusters:")
-    for idx, cluster in enumerate(clusters, start=1):
-        lines.append(
-            f"{idx}. theme={cluster.get('theme', 'N/A')}; count={cluster.get('count', 0)}; "
-            f"best_score={cluster.get('best_score', 0)}; samples={', '.join(cluster.get('sample_titles', [])[:3])}"
-        )
-    return "\n".join(lines)
 
 
 def call_weekly_qwen_synthesis(
