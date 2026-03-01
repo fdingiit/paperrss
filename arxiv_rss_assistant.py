@@ -39,6 +39,7 @@ setup_logging = paperrss_utils.setup_logging
 
 
 ARXIV_API = "https://export.arxiv.org/api/query"
+QWEN_COMPAT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 ATOM_NS = {"atom": "http://www.w3.org/2005/Atom"}
 
 DEFAULT_CATEGORIES = ["cs.LG", "cs.AI", "cs.CL", "cs.DC", "stat.ML"]
@@ -244,7 +245,7 @@ def classify_paper(paper: Paper) -> dict:
     if not relevant and primary_domain == "infrastructure" and domain_scores[primary_domain] >= 2:
         relevant = True
 
-    relevance_score = (
+    heuristic_score = (
         domain_scores[primary_domain] * 4
         + llm_hint_score * 3
         + sum(domain_scores.values())
@@ -254,7 +255,8 @@ def classify_paper(paper: Paper) -> dict:
     return {
         "relevant": relevant,
         "primary_domain": primary_domain,
-        "relevance_score": relevance_score,
+        "heuristic_score": heuristic_score,
+        "score": heuristic_score,
         "inference_accel_score": inference_accel_score,
         "inference_accel_hits": inference_accel_hits,
         "is_inference_accel": is_inference_accel,
@@ -265,23 +267,20 @@ def classify_paper(paper: Paper) -> dict:
 
 
 def ranking_tuple(paper: Paper, meta: dict, sort_priority: str) -> tuple:
+    unified_score = int(meta.get("score", 0) or 0)
     if sort_priority == "recent":
-        return (paper.published.timestamp(), meta["relevance_score"])
+        return (paper.published.timestamp(), unified_score)
 
     if sort_priority == "balanced":
         return (
             1 if meta["relevant"] else 0,
-            meta["relevance_score"],
+            unified_score,
             paper.published.timestamp(),
         )
 
-    # Highest-priority mode: inference acceleration papers first.
     return (
-        1 if meta["is_inference_accel"] else 0,
-        1 if meta["primary_domain"] == "inference" else 0,
-        meta["inference_accel_score"],
         1 if meta["relevant"] else 0,
-        meta["relevance_score"],
+        unified_score,
         paper.published.timestamp(),
     )
 
@@ -291,15 +290,348 @@ def build_paper_brief(paper: Paper, meta: dict) -> dict[str, str]:
     hits = meta["domain_hits"][domain] + meta["llm_hits"]
     hits = list(dict.fromkeys(hits))[:6]
     focus_label = "relevant" if meta["relevant"] else "background"
-    tags = list(dict.fromkeys([domain, focus_label] + hits[:4]))
+    heuristic_tags = list(dict.fromkeys([domain, focus_label] + hits[:4]))
+    llm_brief = meta.get("llm_brief", {})
+    llm_tags = [normalize(str(tag)).lower() for tag in llm_brief.get("tags", []) if normalize(str(tag))]
+    tags = llm_tags or heuristic_tags
     # Keep the full arXiv abstract text (no summarization/truncation).
     abstract_text = normalize(paper.summary)
     if not abstract_text:
         abstract_text = "N/A"
+    brief_text = normalize(llm_brief.get("brief", ""))
+    if not brief_text:
+        signal_text = ", ".join(heuristic_tags[:4]) or domain
+        brief_text = f"Heuristic only: likely {domain}; signals include {signal_text}."
+    interest_matches = [
+        normalize(str(item))
+        for item in llm_brief.get("interest_matches", [])
+        if normalize(str(item))
+    ]
     return {
+        "brief": brief_text,
         "abstract": abstract_text,
         "tags": " / ".join(tags),
+        "score": str(int(meta.get("score", llm_brief.get("score", llm_brief.get("recommendation_score", meta.get("heuristic_score", 0)))) or 0)),
+        "interest_matches": " / ".join(interest_matches) if interest_matches else "N/A",
     }
+
+
+def select_daily_top_picks(ranked_rows: list[tuple[Paper, dict]], limit: int = 6) -> list[tuple[Paper, dict]]:
+    relevant = [row for row in ranked_rows if row[1]["relevant"]]
+    picks = relevant[:limit]
+    if len(picks) >= limit:
+        return picks
+    seen = {paper.paper_id for paper, _ in picks}
+    for row in ranked_rows:
+        paper, _ = row
+        if paper.paper_id in seen:
+            continue
+        picks.append(row)
+        seen.add(paper.paper_id)
+        if len(picks) >= limit:
+            break
+    return picks
+
+
+def load_llm_brief_cache(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_llm_brief_cache(path: Path, cache: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _extract_json_object(text: str) -> dict[str, Any]:
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    try:
+        data = json.loads(cleaned)
+        return data if isinstance(data, dict) else {}
+    except json.JSONDecodeError:
+        pass
+
+    match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+    if not match:
+        return {}
+    try:
+        data = json.loads(match.group(0))
+        return data if isinstance(data, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def _normalize_tags(value: Any) -> list[str]:
+    if isinstance(value, list):
+        raw_tags = value
+    elif isinstance(value, str):
+        raw_tags = re.split(r"[,/\n|]+", value)
+    else:
+        raw_tags = []
+    tags: list[str] = []
+    for item in raw_tags:
+        tag = normalize(str(item)).lower()
+        if tag:
+            tags.append(tag)
+    return list(dict.fromkeys(tags))[:6]
+
+
+def _normalize_interest_matches(value: Any) -> list[str]:
+    if isinstance(value, list):
+        raw_items = value
+    elif isinstance(value, str):
+        raw_items = re.split(r"[,/\n|]+", value)
+    else:
+        raw_items = []
+    items: list[str] = []
+    for item in raw_items:
+        match = normalize(str(item))
+        if match:
+            items.append(match)
+    return list(dict.fromkeys(items))[:6]
+
+
+def normalize_llm_brief_result(result: dict[str, Any], fallback_score: int = 0) -> dict[str, Any]:
+    normalized = dict(result or {})
+    try:
+        score = int(normalized.get("score", normalized.get("recommendation_score", fallback_score)) or 0)
+    except (TypeError, ValueError):
+        score = fallback_score
+    score = max(0, min(100, score))
+    normalized["score"] = score
+    normalized.pop("recommendation_score", None)
+    normalized["tags"] = _normalize_tags(normalized.get("tags"))
+    normalized["interest_matches"] = _normalize_interest_matches(normalized.get("interest_matches"))
+    normalized["brief"] = normalize(str(normalized.get("brief", "")))[:600]
+    normalized["model"] = str(normalized.get("model", ""))
+    normalized["source"] = str(normalized.get("source", ""))
+    normalized["error"] = normalized.get("error")
+    return normalized
+
+
+def build_qwen_brief_prompt(paper: Paper, meta: dict, interest_topics: list[str]) -> str:
+    domain = meta["primary_domain"]
+    hints = list(dict.fromkeys(meta["domain_hits"][domain] + meta["llm_hits"]))[:8]
+    hint_text = ", ".join(hints) if hints else "none"
+    interest_text = "; ".join(interest_topics) if interest_topics else "LLM training; LLM inference; LLM infrastructure"
+    return (
+        "Read this arXiv paper metadata and abstract.\n"
+        "Return strict JSON only with this schema:\n"
+        '{"brief":"2-3 concise Chinese sentences, keep technical terms in English when needed",'
+        '"tags":["3-6 short lowercase English tags"],'
+        '"score":0,'
+        '"interest_matches":["matched interest points from the user list"]}\n'
+        "Requirements:\n"
+        "- Focus on method, practical engineering value, and why it matters for LLM training/inference/infrastructure.\n"
+        "- score must be an integer between 0 and 100.\n"
+        "- score is the single final ranking score, based on fit to the user interests, engineering usefulness, and novelty.\n"
+        "- interest_matches must only contain exact or slightly normalized items from the user interest list.\n"
+        "- No markdown, no code fence, no extra keys.\n"
+        f"- Domain guess: {domain}\n"
+        f"- Heuristic tags: {hint_text}\n"
+        f"- User subscribed interests: {interest_text}\n\n"
+        f"Title: {paper.title}\n"
+        f"Abstract: {normalize(paper.summary) or 'N/A'}\n"
+    )
+
+
+def call_qwen_brief(
+    paper: Paper,
+    meta: dict,
+    interest_topics: list[str],
+    api_key: str,
+    base_url: str,
+    model: str,
+    timeout: int,
+) -> dict[str, Any]:
+    endpoint = base_url.rstrip("/") + "/chat/completions"
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are an expert research assistant for large-model engineering. "
+                    "You read arXiv abstracts and produce concise, practical paper briefs, tags, and a single final score."
+                ),
+            },
+            {"role": "user", "content": build_qwen_brief_prompt(paper, meta, interest_topics)},
+        ],
+        "temperature": 0.2,
+        "stream": False,
+        "max_tokens": 320,
+    }
+    req = urllib.request.Request(
+        endpoint,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "paperrss-assistant/1.0",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        raw = json.loads(response.read().decode("utf-8", errors="ignore"))
+
+    content = (
+        raw.get("choices", [{}])[0]
+        .get("message", {})
+        .get("content", "")
+    )
+    parsed = _extract_json_object(content)
+    brief = normalize(str(parsed.get("brief", "")))
+    tags = _normalize_tags(parsed.get("tags"))
+    interest_matches = _normalize_interest_matches(parsed.get("interest_matches"))
+    if not brief:
+        brief = normalize(str(content))
+    return normalize_llm_brief_result({
+        "brief": brief[:600],
+        "tags": tags,
+        "score": parsed.get("score", parsed.get("recommendation_score", 0)),
+        "interest_matches": interest_matches,
+        "model": model,
+        "source": "qwen",
+        "error": None,
+    })
+
+
+def attach_llm_briefs(
+    ranked_rows: list[tuple[Paper, dict]],
+    enabled: bool,
+    interest_topics: list[str],
+    api_key: str,
+    base_url: str,
+    model: str,
+    cache_path: Path,
+    max_papers: int,
+    timeout: int,
+    workers: int,
+) -> None:
+    if not enabled or not api_key or not ranked_rows:
+        return
+
+    cache = load_llm_brief_cache(cache_path)
+    updated = False
+    pending: list[tuple[int, Paper, dict]] = []
+    for idx, (paper, meta) in enumerate(ranked_rows, start=1):
+        if idx > max_papers:
+            meta["llm_brief"] = normalize_llm_brief_result({
+                "brief": "",
+                "tags": [],
+                "score": 0,
+                "interest_matches": [],
+                "model": model,
+                "source": "qwen",
+                "error": f"skipped_by_limit(max_papers={max_papers})",
+            }, fallback_score=int(meta.get("heuristic_score", 0)))
+            logger.info("llm_brief_skipped id=%s reason=limit rank=%s", paper.paper_id, idx)
+            continue
+        cached = cache.get(paper.paper_id)
+        if cached and ("score" in cached or "recommendation_score" in cached) and "interest_matches" in cached:
+            meta["llm_brief"] = normalize_llm_brief_result(cached, fallback_score=int(meta.get("heuristic_score", 0)))
+            logger.info("llm_brief_cache_hit id=%s", paper.paper_id)
+            continue
+        pending.append((idx, paper, meta))
+
+    if not pending:
+        return
+
+    logger.info(
+        "llm_brief_stage_start pending=%s workers=%s timeout=%s model=%s",
+        len(pending),
+        max(1, workers),
+        timeout,
+        model,
+    )
+
+    def _run_llm(paper: Paper, meta: dict) -> dict[str, Any]:
+        return call_qwen_brief(
+            paper,
+            meta,
+            interest_topics=interest_topics,
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            timeout=timeout,
+        )
+
+    if workers <= 1:
+        future_results: list[tuple[int, Paper, dict, dict[str, Any]]] = []
+        for idx, paper, meta in pending:
+            logger.info("llm_brief_request_start id=%s rank=%s", paper.paper_id, idx)
+            try:
+                result = _run_llm(paper, meta)
+            except Exception as exc:  # noqa: BLE001
+                result = normalize_llm_brief_result({
+                    "brief": "",
+                    "tags": [],
+                    "score": 0,
+                    "interest_matches": [],
+                    "model": model,
+                    "source": "qwen",
+                    "error": str(exc),
+                }, fallback_score=int(meta.get("heuristic_score", 0)))
+            future_results.append((idx, paper, meta, result))
+        for idx, paper, meta, result in future_results:
+            result = normalize_llm_brief_result(result, fallback_score=int(meta.get("heuristic_score", 0)))
+            meta["llm_brief"] = result
+            cache[paper.paper_id] = result
+            updated = True
+            logger.info(
+                "llm_brief_done id=%s rank=%s score=%s tags=%s interests=%s err=%s",
+                paper.paper_id,
+                idx,
+                result.get("score", 0),
+                result.get("tags", []),
+                result.get("interest_matches", []),
+                result.get("error"),
+            )
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+            future_map: dict[concurrent.futures.Future[dict[str, Any]], tuple[int, Paper, dict]] = {}
+            for idx, paper, meta in pending:
+                logger.info("llm_brief_request_start id=%s rank=%s", paper.paper_id, idx)
+                future_map[pool.submit(_run_llm, paper, meta)] = (idx, paper, meta)
+            for future in concurrent.futures.as_completed(future_map):
+                idx, paper, meta = future_map[future]
+                try:
+                    result = future.result()
+                except Exception as exc:  # noqa: BLE001
+                    result = normalize_llm_brief_result({
+                        "brief": "",
+                        "tags": [],
+                        "score": 0,
+                        "interest_matches": [],
+                        "model": model,
+                        "source": "qwen",
+                        "error": str(exc),
+                    }, fallback_score=int(meta.get("heuristic_score", 0)))
+                result = normalize_llm_brief_result(result, fallback_score=int(meta.get("heuristic_score", 0)))
+                meta["llm_brief"] = result
+                cache[paper.paper_id] = result
+                updated = True
+                logger.info(
+                    "llm_brief_done id=%s rank=%s score=%s tags=%s interests=%s err=%s",
+                    paper.paper_id,
+                    idx,
+                    result.get("score", 0),
+                    result.get("tags", []),
+                    result.get("interest_matches", []),
+                    result.get("error"),
+                )
+
+    logger.info("llm_brief_stage_done pending=%s", len(pending))
+    if updated:
+        save_llm_brief_cache(cache_path, cache)
 
 
 def load_author_cache(path: Path) -> dict:
@@ -569,6 +901,7 @@ def render_report(
     ranked_rows: list[tuple[Paper, dict]],
 ) -> None:
     relevant_rows = [row for row in ranked_rows if row[1]["relevant"]]
+    top_picks = select_daily_top_picks(ranked_rows, limit=6)
     domain_counter = Counter(row[1]["primary_domain"] for row in relevant_rows)
     keyword_counter = Counter()
     for _, meta in relevant_rows:
@@ -585,7 +918,7 @@ def render_report(
     lines.append("")
 
     if ranked_rows:
-        lines.append("## Overview")
+        lines.append("## Today At A Glance")
         lines.append("")
         lines.append(
             "- Domain distribution: "
@@ -593,11 +926,28 @@ def render_report(
         )
         top_keywords = ", ".join(f"{k}({v})" for k, v in keyword_counter.most_common(10))
         lines.append(f"- Top keywords: {top_keywords or 'N/A'}")
+        lines.append(f"- Reading mode: detailed top picks first, then full ranked list")
         lines.append("")
 
-        lines.append("## Ranked Papers (Full List)")
+        lines.append("## Top Picks")
         lines.append("")
-        lines.append("> Briefs are generated from arXiv abstracts (not full PDF reading).")
+        if any(meta.get("llm_brief", {}).get("brief") for _, meta in ranked_rows):
+            lines.append("> Briefs are generated by Qwen from arXiv abstracts (not full PDF reading).")
+        else:
+            lines.append("> Briefs are generated from arXiv abstracts (not full PDF reading).")
+        lines.append("")
+        for i, (paper, meta) in enumerate(top_picks, start=1):
+            brief = build_paper_brief(paper, meta)
+            lines.append(f"### Pick {i}. {paper.title}")
+            lines.append("")
+            lines.append(f"- Score: {brief['score']}")
+            lines.append(f"- Tags: {brief['tags']}")
+            lines.append(f"- Interest matches: {brief['interest_matches']}")
+            lines.append(f"- Why read today: {brief['brief']}")
+            lines.append(f"- Link: {paper.link}")
+            lines.append("")
+
+        lines.append("## Full Ranked Papers")
         lines.append("")
         for i, (paper, meta) in enumerate(ranked_rows, start=1):
             brief = build_paper_brief(paper, meta)
@@ -613,11 +963,13 @@ def render_report(
             lines.append("")
             lines.append(f"- Link: {paper.link}")
             lines.append(f"- Published: {paper.published.strftime('%Y-%m-%d %H:%M UTC')}")
-            lines.append(f"- Ranking score: {meta['relevance_score']}")
+            lines.append(f"- Score: {brief['score']}")
             lines.append(f"- Authors: {authors_text}")
             if emails:
                 lines.append(f"- Author emails (from HTML): {', '.join(emails[:5])}")
+            lines.append(f"- Brief: {brief['brief']}")
             lines.append(f"- Tags: {brief['tags']}")
+            lines.append(f"- Interest matches: {brief['interest_matches']}")
             lines.append(f"- Abstract: {brief['abstract']}")
             lines.append("")
     else:
@@ -647,6 +999,7 @@ def build_slack_messages(
     report_path: Path,
 ) -> list[dict[str, Any]]:
     relevant_rows = [row for row in ranked_rows if row[1]["relevant"]]
+    top_picks = select_daily_top_picks(ranked_rows, limit=5)
     domain_counter = Counter(row[1]["primary_domain"] for row in relevant_rows)
     header_text = (
         f"arXiv Daily LLM Radar ({run_at.strftime('%Y-%m-%d')}) | "
@@ -676,13 +1029,27 @@ def build_slack_messages(
             ],
         }]
 
-    # One Slack message per paper, plus a single overview message.
+    top_pick_lines: list[str] = []
+    for idx, (paper, meta) in enumerate(top_picks, start=1):
+        brief = build_paper_brief(paper, meta)
+        top_pick_lines.append(
+            f"{idx}. [{brief['score']}] <{paper.link}|{paper.title}>"
+        )
+
+    # Daily mode: one overview + one top-picks summary + one message per paper.
     messages: list[dict[str, Any]] = [{
         "text": header_text,
         "blocks": [
             {"type": "header", "text": {"type": "plain_text", "text": "arXiv Daily LLM Radar"}},
             {"type": "section", "fields": overview_fields},
-            {"type": "context", "elements": [{"type": "mrkdwn", "text": "Delivery mode: one paper per message"}]},
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "*Today’s Top Picks*\n" + ("\n".join(top_pick_lines) if top_pick_lines else "No picks."),
+                },
+            },
+            {"type": "context", "elements": [{"type": "mrkdwn", "text": "Delivery mode: top-picks summary first, then one paper per message"}]},
         ],
     }]
     total = len(ranked_rows)
@@ -708,7 +1075,7 @@ def build_slack_messages(
                 {
                     "type": "section",
                     "fields": [
-                        {"type": "mrkdwn", "text": f"*Score*\n{meta['relevance_score']}"},
+                        {"type": "mrkdwn", "text": f"*Score*\n{brief['score']}"},
                         {"type": "mrkdwn", "text": f"*Published*\n{paper.published.strftime('%Y-%m-%d %H:%M UTC')}"},
                         {"type": "mrkdwn", "text": f"*Tags*\n{brief['tags']}"},
                         {"type": "mrkdwn", "text": f"*{author_field_label}*\n{author_field_value}"},
@@ -718,7 +1085,21 @@ def build_slack_messages(
                     "type": "section",
                     "text": {
                         "type": "mrkdwn",
-                        "text": f"*Abstract (snippet)*\n{truncate_for_slack(brief['abstract'])}",
+                        "text": f"*Interest matches*\n{brief['interest_matches']}",
+                    },
+                },
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*Brief*\n{truncate_for_slack(brief['brief'], max_len=300)}",
+                    },
+                },
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*Abstract (snippet)*\n{truncate_for_slack(brief['abstract'], max_len=500)}",
                     },
                 },
                 {
@@ -845,12 +1226,12 @@ def run(args: argparse.Namespace) -> int:
     now = datetime.now(timezone.utc)
     today_str = now.strftime("%Y-%m-%d")
     config = load_config(Path(args.config))
-    state_path = Path(args.state)
+    state_path = Path(args.state or config.get("rss_state", "storage/data/state.json"))
     subscription_store_path = Path(
         args.subscription_store or config.get("subscription_store", "storage/data/subscriptions.json")
     )
     push_state_path = Path(args.push_state or config.get("push_state", "storage/data/push_state.json"))
-    output_dir = Path(args.output_dir)
+    output_dir = Path(args.output_dir or config.get("rss_output_dir", "storage/reports"))
 
     state = load_state(state_path)
     subscription_store = load_subscription_store(subscription_store_path)
@@ -904,10 +1285,9 @@ def run(args: argparse.Namespace) -> int:
             paper.paper_id,
             meta["primary_domain"],
             meta["relevant"],
-            meta["relevance_score"],
+            meta["heuristic_score"],
             meta.get("is_inference_accel", False),
         )
-    ranked_rows.sort(key=lambda row: ranking_tuple(row[0], row[1], sort_priority), reverse=True)
     author_enrich = (
         args.author_enrich
         if args.author_enrich is not None
@@ -933,6 +1313,60 @@ def run(args: argparse.Namespace) -> int:
             with_email,
             with_email / max(len(ranked_rows), 1),
         )
+    llm_brief_enabled = (
+        getattr(args, "llm_brief_enabled", None)
+        if getattr(args, "llm_brief_enabled", None) is not None
+        else parse_bool(config.get("llm_brief_enabled", False), default=False)
+    )
+    interest_topics = list(config.get("interest_topics", []))
+    if not interest_topics:
+        interest_topics = [
+            "大模型训练",
+            "大模型推理",
+            "大模型基础设施",
+            "推理加速",
+            "distributed training",
+            "serving system",
+        ]
+    llm_brief_api_key = str(config.get("llm_brief_api_key", "")).strip()
+    llm_brief_base_url = str(config.get("llm_brief_base_url", QWEN_COMPAT_BASE_URL)).strip() or QWEN_COMPAT_BASE_URL
+    llm_brief_model = str(config.get("llm_brief_model", "qwen-long")).strip() or "qwen-long"
+    llm_brief_cache_path = Path(config.get("llm_brief_cache", "storage/data/llm_brief_cache.json"))
+    llm_brief_max_papers = int(config.get("llm_brief_max_papers", 250))
+    llm_brief_timeout = int(config.get("llm_brief_timeout_seconds", 20))
+    llm_brief_workers = int(config.get("llm_brief_workers", 4))
+    llm_score_threshold = int(config.get("llm_score_threshold", config.get("llm_recommendation_threshold", 60)))
+    attach_llm_briefs(
+        ranked_rows,
+        enabled=llm_brief_enabled,
+        interest_topics=interest_topics,
+        api_key=llm_brief_api_key,
+        base_url=llm_brief_base_url,
+        model=llm_brief_model,
+        cache_path=llm_brief_cache_path,
+        max_papers=llm_brief_max_papers,
+        timeout=llm_brief_timeout,
+        workers=llm_brief_workers,
+    )
+    if llm_brief_enabled and ranked_rows:
+        llm_ok = sum(1 for _, meta in ranked_rows if meta.get("llm_brief", {}).get("brief"))
+        llm_err = sum(1 for _, meta in ranked_rows if meta.get("llm_brief", {}).get("error"))
+        logger.info(
+            "llm_brief_coverage papers=%s with_brief=%s failed=%s ratio=%.3f model=%s",
+            len(ranked_rows),
+            llm_ok,
+            llm_err,
+            llm_ok / max(len(ranked_rows), 1),
+            llm_brief_model,
+        )
+        for _, meta in ranked_rows:
+            llm_score = int(meta.get("llm_brief", {}).get("score", 0) or 0)
+            meta["score"] = llm_score
+            meta["relevant"] = llm_score >= llm_score_threshold
+    else:
+        for _, meta in ranked_rows:
+            meta["score"] = int(meta.get("heuristic_score", 0) or 0)
+    ranked_rows.sort(key=lambda row: ranking_tuple(row[0], row[1], sort_priority), reverse=True)
     relevant_rows = [row for row in ranked_rows if row[1]["relevant"]]
     for idx, (paper, meta) in enumerate(ranked_rows, start=1):
         logger.info(
@@ -941,11 +1375,15 @@ def run(args: argparse.Namespace) -> int:
             paper.paper_id,
             meta["primary_domain"],
             meta["relevant"],
-            meta["relevance_score"],
+            meta["score"],
             paper.title,
         )
 
-    webhook_url = args.slack_webhook_url or config.get("slack_webhook_url") or os.getenv("SLACK_WEBHOOK_URL")
+    webhook_url = (
+        args.slack_webhook_url
+        if args.slack_webhook_url is not None
+        else config.get("slack_webhook_url") or os.getenv("SLACK_WEBHOOK_URL")
+    )
     slack_when = args.slack_when or config.get("slack_when", "any")
     force_push_date = str(config.get("force_push_date", "")).strip()
     force_push_today = force_push_date == today_str
@@ -1080,7 +1518,7 @@ def run(args: argparse.Namespace) -> int:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Incremental arXiv RSS assistant")
     parser.add_argument("--version", action="version", version=f"%(prog)s {APP_VERSION}")
-    parser.add_argument("--config", default="config.json", help="Path to JSON config file")
+    parser.add_argument("--config", default="storage/config.json", help="Path to JSON config file")
     parser.add_argument(
         "--categories",
         nargs="+",
@@ -1088,10 +1526,10 @@ def parse_args() -> argparse.Namespace:
         help="arXiv categories to query (default: cs.LG cs.AI cs.CL cs.DC stat.ML)",
     )
     parser.add_argument("--max-results", type=int, default=250, help="Max results fetched from arXiv API")
-    parser.add_argument("--state", default="storage/data/state.json", help="Path to local state JSON")
+    parser.add_argument("--state", default=None, help="Path to local state JSON")
     parser.add_argument("--subscription-store", default=None, help="Path to subscription seen-id store JSON")
     parser.add_argument("--push-state", default=None, help="Path to push dedupe state JSON")
-    parser.add_argument("--output-dir", default="storage/reports", help="Directory for generated markdown reports")
+    parser.add_argument("--output-dir", default=None, help="Directory for generated markdown reports")
     parser.add_argument(
         "--feed-file",
         default=None,
@@ -1139,6 +1577,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.set_defaults(author_enrich=None)
     parser.add_argument("--author-cache", default=None, help="Path to author enrichment cache JSON")
+    parser.add_argument(
+        "--llm-brief",
+        dest="llm_brief_enabled",
+        action="store_true",
+        help="Enable Qwen brief generation from title + abstract",
+    )
+    parser.add_argument(
+        "--no-llm-brief",
+        dest="llm_brief_enabled",
+        action="store_false",
+        help="Disable Qwen brief generation",
+    )
+    parser.set_defaults(llm_brief_enabled=None)
     parser.add_argument("--log-level", default="INFO", help="Logging level: DEBUG/INFO/WARN/ERROR")
     parser.add_argument("--log-file", default=None, help="Optional log file path")
     return parser.parse_args()

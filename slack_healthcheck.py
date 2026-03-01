@@ -118,7 +118,7 @@ def run(args: argparse.Namespace) -> int:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Slack ping/pong healthcheck bot")
     parser.add_argument("--version", action="version", version=f"%(prog)s {APP_VERSION}")
-    parser.add_argument("--config", default="config.json", help="Path to JSON config")
+    parser.add_argument("--config", default="storage/config.json", help="Path to JSON config")
     parser.add_argument("--bot-token", default=None, help="Slack Bot User OAuth Token (xoxb-...) ")
     parser.add_argument("--channel-id", default=None, help="Slack channel ID (e.g., C0123456789)")
     parser.add_argument("--state", default="data/healthcheck_state.json", help="State file path")

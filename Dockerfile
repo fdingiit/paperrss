@@ -13,11 +13,10 @@ RUN pip install --no-cache-dir websocket-client
 COPY app_daemon.py arxiv_rss_assistant.py slack_cmd_toolkit.py slack_healthcheck.py paperrss_version.py paperrss_utils.py /app/
 COPY VERSION /app/VERSION
 COPY config.example.json README.md /app/
-COPY config.json /app/config.json
 
 # Runtime directories for generated outputs/state.
 RUN mkdir -p /app/storage/data /app/storage/reports /app/logs
 
 EXPOSE 8080
 
-CMD ["python", "app_daemon.py", "--config", "config.json", "--log-level", "INFO", "--log-file", "/app/logs/app.log"]
+CMD ["python", "app_daemon.py", "--config", "storage/config.json", "--log-level", "INFO", "--log-file", "/app/logs/app.log"]

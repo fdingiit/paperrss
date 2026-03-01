@@ -95,7 +95,7 @@ def _extract_report_stats(text: str) -> tuple[int, int, list[dict[str, str]]]:
 
 def build_daily_brief_payload(report_dir: str) -> dict:
     report_root = Path(report_dir)
-    files = sorted(report_root.glob("*.md"))
+    files = sorted(path for path in report_root.glob("*.md") if re.match(r"^\d{4}-\d{2}-\d{2}\.md$", path.name))
     if not files:
         return {"text": "No report found yet. Run RSS scan first."}
 
@@ -152,7 +152,14 @@ def build_daily_brief_payload(report_dir: str) -> dict:
                     {"type": "mrkdwn", "text": f"*Total ranked*\n{len(entries)}"},
                 ],
             },
-            {"type": "section", "text": {"type": "mrkdwn", "text": f"*Top Papers*\n{top_text}"}},
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "*Daily mode*\nRead the top picks first, then drill into the full ranked report if needed.",
+                },
+            },
+            {"type": "section", "text": {"type": "mrkdwn", "text": f"*Top Picks*\n{top_text}"}},
             *(
                 [
                     {
@@ -181,7 +188,13 @@ def build_command_response(command: str, health_url: str | None, report_dir: str
                 body = resp.read().decode("utf-8", errors="ignore")
             payload = json.loads(body)
             rss = payload.get("rss", {})
+            weekly = payload.get("weekly", {})
             cmd = payload.get("pingpong", {})
+            server_now_utc = payload.get("server_now_utc", "N/A")
+            server_now_bjt = payload.get("server_now_bjt", "N/A")
+            server_now_local = payload.get("server_now_local", "N/A")
+            server_local_tz = payload.get("server_local_tz", "N/A")
+            scheduler_timezone = payload.get("scheduler_timezone", "Asia/Shanghai")
             now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
             blocks = [
                 {"type": "header", "text": {"type": "plain_text", "text": "Pong"}},
@@ -190,8 +203,19 @@ def build_command_response(command: str, health_url: str | None, report_dir: str
                     "fields": [
                         {"type": "mrkdwn", "text": f"*Now*\n{now}"},
                         {"type": "mrkdwn", "text": f"*Health URL*\n{health_url}"},
-                        {"type": "mrkdwn", "text": f"*RSS Status*\n{rss.get('last_status', 'unknown')}"},
+                        {"type": "mrkdwn", "text": f"*Daily Status*\n{rss.get('last_status', 'unknown')}"},
+                        {"type": "mrkdwn", "text": f"*Weekly Status*\n{weekly.get('last_status', 'unknown')}"},
                         {"type": "mrkdwn", "text": f"*CMD Status*\n{cmd.get('last_status', 'unknown')}"},
+                    ],
+                },
+                {
+                    "type": "section",
+                    "fields": [
+                        {"type": "mrkdwn", "text": f"*Server UTC*\n`{server_now_utc}`"},
+                        {"type": "mrkdwn", "text": f"*Server BJT*\n`{server_now_bjt}`"},
+                        {"type": "mrkdwn", "text": f"*Host Local Time*\n`{server_now_local}`"},
+                        {"type": "mrkdwn", "text": f"*Host Local TZ*\n`{server_local_tz}`"},
+                        {"type": "mrkdwn", "text": f"*Scheduler TZ*\n`{scheduler_timezone}`"},
                     ],
                 },
                 {
@@ -199,8 +223,14 @@ def build_command_response(command: str, health_url: str | None, report_dir: str
                     "text": {
                         "type": "mrkdwn",
                         "text": (
-                            "*Last RSS Run*\n"
+                            "*Last Daily Run*\n"
                             f"`{rss.get('last_run_at', 'N/A')}`\n"
+                            "*Next Daily Run*\n"
+                            f"`{rss.get('next_run_at', 'N/A')}`\n"
+                            "*Last Weekly Run*\n"
+                            f"`{weekly.get('last_run_at', 'N/A')}`\n"
+                            "*Next Weekly Run*\n"
+                            f"`{weekly.get('next_run_at', 'N/A')}`\n"
                             "*Last CMD Reply*\n"
                             f"`{cmd.get('last_reply_at', 'N/A')}`"
                         ),
@@ -221,8 +251,8 @@ def build_command_response(command: str, health_url: str | None, report_dir: str
                         "type": "mrkdwn",
                         "text": (
                             "*Capabilities*\n"
-                            "I monitor arXiv daily for LLM training/inference/infrastructure papers, "
-                            "push ranked rich-format updates to Slack, and support ops/debug commands."
+                            "I monitor arXiv for LLM training/inference/infrastructure papers, "
+                            "push reading-oriented daily reports and theme-oriented weekly digests to Slack, and support ops/debug commands."
                         ),
                     },
                 },
@@ -346,7 +376,7 @@ def run(args: argparse.Namespace) -> int:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Slack command toolkit")
     parser.add_argument("--version", action="version", version=f"%(prog)s {APP_VERSION}")
-    parser.add_argument("--config", default="config.json", help="Path to JSON config")
+    parser.add_argument("--config", default="storage/config.json", help="Path to JSON config")
     parser.add_argument("--bot-token", default=None, help="Slack bot token xoxb-...")
     parser.add_argument("--channel-id", default=None, help="Slack channel ID")
     parser.add_argument("--health-url", default=None, help="Health endpoint URL for -ping")
