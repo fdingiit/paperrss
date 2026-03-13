@@ -278,8 +278,10 @@ def ranking_tuple(paper: Paper, meta: dict, sort_priority: str) -> tuple:
             paper.published.timestamp(),
         )
 
+    # Default: "inference_acceleration" – boost papers classified as inference-accel.
     return (
         1 if meta["relevant"] else 0,
+        1 if meta.get("is_inference_accel") else 0,
         unified_score,
         paper.published.timestamp(),
     )
