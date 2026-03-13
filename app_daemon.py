@@ -209,6 +209,10 @@ def _normalize_text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip())
 
 
+def _contains_chinese(text: Any) -> bool:
+    return bool(re.search(r"[\u4e00-\u9fff]", str(text or "")))
+
+
 def _extract_json_object(text: str) -> dict[str, Any]:
     cleaned = _normalize_text(text)
     if cleaned.startswith("```"):
@@ -420,8 +424,18 @@ def call_weekly_qwen_synthesis(
         takeaways = [_normalize_text(item) for item in takeaways_raw if _normalize_text(item)]
     else:
         takeaways = [_normalize_text(item) for item in re.split(r"[\n;]+", str(takeaways_raw or "")) if _normalize_text(item)]
+    theme_summary = _normalize_text(parsed.get("theme_summary", ""))[:600]
+    if not _contains_chinese(theme_summary):
+        theme_summary = "本周论文整体围绕大模型训练、推理优化与系统工程展开，建议优先关注可复现且具备工程收益的方法。"
+    takeaways = [item for item in takeaways if _contains_chinese(item)]
+    if not takeaways:
+        takeaways = [
+            "优先评估可复现的训练或推理优化方法，并量化收益与成本。",
+            "上线前建议补齐稳定性、可观测性与安全性验证链路。",
+            "对高分论文可先做小规模实验，再决定是否进入生产路线图。",
+        ]
     return {
-        "theme_summary": _normalize_text(parsed.get("theme_summary", ""))[:600],
+        "theme_summary": theme_summary,
         "takeaways": takeaways[:5],
         "model": model,
         "source": "qwen",
@@ -685,6 +699,23 @@ def build_weekly_slack_payload(summary: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def build_daily_start_payload(due_key: str, now_local: datetime) -> dict[str, Any]:
+    now_text = now_local.strftime("%Y-%m-%d %H:%M:%S %z")
+    return {
+        "text": f"RSS daily run started ({due_key})",
+        "blocks": [
+            {"type": "header", "text": {"type": "plain_text", "text": "RSS Daily Run Started"}},
+            {
+                "type": "section",
+                "fields": [
+                    {"type": "mrkdwn", "text": f"*Due Key*\n`{due_key}`"},
+                    {"type": "mrkdwn", "text": f"*Trigger Time (BJT)*\n`{now_text}`"},
+                ],
+            },
+        ],
+    }
+
+
 def daily_rss_loop(
     stop_event: threading.Event,
     app_state: AppState,
@@ -700,6 +731,10 @@ def daily_rss_loop(
 
     daily_hour, daily_minute = parse_clock_hhmm(config.get("daily_report_time_bjt", "09:00"), 9, 0)
     schedule_state_path = Path(config.get("schedule_state", "storage/data/schedule_state.json"))
+    try:
+        daily_retry_seconds = max(1.0, float(config.get("daily_retry_seconds", 300)))
+    except (TypeError, ValueError):
+        daily_retry_seconds = 300.0
     while not stop_event.is_set():
         now_local = datetime.now(SHANGHAI_TZ)
         schedule_state = load_schedule_state(schedule_state_path)
@@ -711,12 +746,33 @@ def daily_rss_loop(
             if stop_event.wait(wait_seconds):
                 break
             continue
+        post_run_wait_seconds = 1.0
         try:
             args = build_rss_args(config_path, config, force_push=False)
             logger.info("daily_scheduler_tick due_key=%s", due_key)
+            webhook_url = config.get("slack_webhook_url")
+            if webhook_url:
+                try:
+                    arxiv_rss_assistant.post_to_slack(
+                        webhook_url,
+                        [build_daily_start_payload(due_key, now_local)],
+                        send_interval_seconds=0.0,
+                        max_retries=int(config.get("slack_max_retries", 4)),
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception("daily_scheduler_start_notify_error due_key=%s", due_key)
             with rss_run_lock:
                 code = arxiv_rss_assistant.run(args)
-            upsert_schedule_state_key(schedule_state_path, "last_daily_key", due_key)
+            if code == 0:
+                upsert_schedule_state_key(schedule_state_path, "last_daily_key", due_key)
+            else:
+                post_run_wait_seconds = daily_retry_seconds
+                logger.warning(
+                    "daily_scheduler_run_failed due_key=%s exit_code=%s retry_in_seconds=%.1f",
+                    due_key,
+                    code,
+                    post_run_wait_seconds,
+                )
             app_state.update(
                 "rss",
                 {
@@ -728,7 +784,12 @@ def daily_rss_loop(
             logger.info("daily_scheduler_done status=%s due_key=%s", "ok" if code == 0 else "error", due_key)
         except Exception as exc:  # noqa: BLE001
             logger.exception("daily_scheduler_error")
-            upsert_schedule_state_key(schedule_state_path, "last_daily_key", due_key)
+            post_run_wait_seconds = daily_retry_seconds
+            logger.warning(
+                "daily_scheduler_exception_retry due_key=%s retry_in_seconds=%.1f",
+                due_key,
+                post_run_wait_seconds,
+            )
             app_state.update(
                 "rss",
                 {
@@ -738,7 +799,7 @@ def daily_rss_loop(
                 },
             )
 
-        if stop_event.wait(1):
+        if stop_event.wait(post_run_wait_seconds):
             break
 
 

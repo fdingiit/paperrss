@@ -41,6 +41,47 @@ setup_logging = paperrss_utils.setup_logging
 ARXIV_API = "https://export.arxiv.org/api/query"
 QWEN_COMPAT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 ATOM_NS = {"atom": "http://www.w3.org/2005/Atom"}
+REPORT_DAY_TZ = timezone(timedelta(hours=8))
+PERSONAL_EMAIL_DOMAINS = {
+    "gmail.com",
+    "googlemail.com",
+    "outlook.com",
+    "hotmail.com",
+    "live.com",
+    "yahoo.com",
+    "yahoo.co.jp",
+    "qq.com",
+    "foxmail.com",
+    "163.com",
+    "126.com",
+    "proton.me",
+    "protonmail.com",
+    "icloud.com",
+}
+MULTI_PART_PUBLIC_SUFFIXES = {
+    "ac.uk",
+    "co.uk",
+    "org.uk",
+    "gov.uk",
+    "ac.jp",
+    "co.jp",
+    "or.jp",
+    "go.jp",
+    "ac.kr",
+    "co.kr",
+    "com.cn",
+    "edu.cn",
+    "org.cn",
+    "gov.cn",
+    "ac.cn",
+    "com.au",
+    "edu.au",
+    "org.au",
+    "net.au",
+    "com.hk",
+    "edu.hk",
+    "org.hk",
+}
 
 DEFAULT_CATEGORIES = ["cs.LG", "cs.AI", "cs.CL", "cs.DC", "stat.ML"]
 
@@ -285,23 +326,45 @@ def ranking_tuple(paper: Paper, meta: dict, sort_priority: str) -> tuple:
     )
 
 
+def report_day_key(published: datetime) -> str:
+    return published.astimezone(REPORT_DAY_TZ).date().isoformat()
+
+
+def build_report_buckets(
+    now: datetime,
+    last_run: datetime | None,
+    new_rows: list[Paper],
+    ranked_rows: list[tuple[Paper, dict]],
+    sort_priority: str,
+) -> list[tuple[str, list[Paper], list[tuple[Paper, dict]]]]:
+    should_split = bool(last_run and (now - last_run) > timedelta(days=1))
+    if not should_split or not ranked_rows:
+        return [(now.strftime("%Y-%m-%d"), new_rows, ranked_rows)]
+
+    grouped: dict[str, list[tuple[Paper, dict]]] = {}
+    for row in ranked_rows:
+        paper, _ = row
+        grouped.setdefault(report_day_key(paper.published), []).append(row)
+
+    buckets: list[tuple[str, list[Paper], list[tuple[Paper, dict]]]] = []
+    for day_key in sorted(grouped):
+        rows = grouped[day_key]
+        rows.sort(key=lambda row: ranking_tuple(row[0], row[1], sort_priority), reverse=True)
+        buckets.append((day_key, [paper for paper, _ in rows], rows))
+    return buckets
+
+
 def build_paper_brief(paper: Paper, meta: dict) -> dict[str, str]:
-    domain = meta["primary_domain"]
-    hits = meta["domain_hits"][domain] + meta["llm_hits"]
-    hits = list(dict.fromkeys(hits))[:6]
-    focus_label = "relevant" if meta["relevant"] else "background"
-    heuristic_tags = list(dict.fromkeys([domain, focus_label] + hits[:4]))
     llm_brief = meta.get("llm_brief", {})
     llm_tags = [normalize(str(tag)).lower() for tag in llm_brief.get("tags", []) if normalize(str(tag))]
-    tags = llm_tags or heuristic_tags
+    tags = llm_tags or _fallback_chinese_tags(meta)
     # Keep the full arXiv abstract text (no summarization/truncation).
     abstract_text = normalize(paper.summary)
     if not abstract_text:
-        abstract_text = "N/A"
+        abstract_text = "无"
     brief_text = normalize(llm_brief.get("brief", ""))
     if not brief_text:
-        signal_text = ", ".join(heuristic_tags[:4]) or domain
-        brief_text = f"Heuristic only: likely {domain}; signals include {signal_text}."
+        brief_text = _fallback_chinese_brief(meta)
     interest_matches = [
         normalize(str(item))
         for item in llm_brief.get("interest_matches", [])
@@ -312,7 +375,7 @@ def build_paper_brief(paper: Paper, meta: dict) -> dict[str, str]:
         "abstract": abstract_text,
         "tags": " / ".join(tags),
         "score": str(int(meta.get("score", llm_brief.get("score", llm_brief.get("recommendation_score", meta.get("heuristic_score", 0)))) or 0)),
-        "interest_matches": " / ".join(interest_matches) if interest_matches else "N/A",
+        "interest_matches": " / ".join(interest_matches) if interest_matches else "无",
     }
 
 
@@ -399,6 +462,60 @@ def _normalize_interest_matches(value: Any) -> list[str]:
     return list(dict.fromkeys(items))[:6]
 
 
+def _contains_chinese(text: Any) -> bool:
+    return bool(re.search(r"[\u4e00-\u9fff]", str(text or "")))
+
+
+def _domain_label_zh(domain: str) -> str:
+    mapping = {
+        "training": "大模型训练",
+        "inference": "大模型推理",
+        "infrastructure": "大模型基础设施",
+    }
+    return mapping.get(str(domain or "").strip().lower(), "大模型工程")
+
+
+def _fallback_chinese_tags(meta: dict) -> list[str]:
+    tags = [_domain_label_zh(str(meta.get("primary_domain", ""))), "工程实践", "论文解读"]
+    if bool(meta.get("is_inference_accel")):
+        tags.insert(1, "推理加速")
+    return list(dict.fromkeys(tags))[:6]
+
+
+def _fallback_chinese_brief(meta: dict) -> str:
+    domain = str(meta.get("primary_domain", ""))
+    domain_hits = list((meta.get("domain_hits", {}) or {}).get(domain, []))
+    llm_hits = list(meta.get("llm_hits", []))
+    hints = list(dict.fromkeys(domain_hits + llm_hits))[:3]
+    hint_text = f"关键线索包括：{'、'.join(hints)}。" if hints else "可从方法设计与实验设置评估其工程价值。"
+    accel_text = "，并包含推理加速相关信号" if bool(meta.get("is_inference_accel")) else ""
+    return (
+        f"该论文主要聚焦{_domain_label_zh(domain)}方向{accel_text}。"
+        f"{hint_text}"
+        "建议结合你的业务场景评估其可复现性、系统收益与落地成本。"
+    )
+
+
+def ensure_chinese_llm_brief_result(
+    result: dict[str, Any],
+    meta: dict,
+    fallback_score: int = 0,
+) -> dict[str, Any]:
+    normalized = normalize_llm_brief_result(result, fallback_score=fallback_score)
+    brief = normalize(str(normalized.get("brief", "")))
+    tags = _normalize_tags(normalized.get("tags"))
+    interests = _normalize_interest_matches(normalized.get("interest_matches"))
+
+    if not _contains_chinese(brief):
+        normalized["brief"] = _fallback_chinese_brief(meta)
+    if not tags or not all(_contains_chinese(tag) for tag in tags):
+        normalized["tags"] = _fallback_chinese_tags(meta)
+    if interests:
+        normalized["interest_matches"] = [item for item in interests if _contains_chinese(item)]
+
+    return normalize_llm_brief_result(normalized, fallback_score=fallback_score)
+
+
 def normalize_llm_brief_result(result: dict[str, Any], fallback_score: int = 0) -> dict[str, Any]:
     normalized = dict(result or {})
     try:
@@ -421,25 +538,26 @@ def build_qwen_brief_prompt(paper: Paper, meta: dict, interest_topics: list[str]
     domain = meta["primary_domain"]
     hints = list(dict.fromkeys(meta["domain_hits"][domain] + meta["llm_hits"]))[:8]
     hint_text = ", ".join(hints) if hints else "none"
-    interest_text = "; ".join(interest_topics) if interest_topics else "LLM training; LLM inference; LLM infrastructure"
+    interest_text = "; ".join(interest_topics) if interest_topics else "大模型训练; 大模型推理; 大模型基础设施"
     return (
-        "Read this arXiv paper metadata and abstract.\n"
-        "Return strict JSON only with this schema:\n"
-        '{"brief":"2-3 concise Chinese sentences, keep technical terms in English when needed",'
-        '"tags":["3-6 short lowercase English tags"],'
+        "请阅读下面的 arXiv 论文标题与摘要，并返回严格 JSON。\n"
+        "只允许返回以下 schema（不得有额外字段）：\n"
+        '{"brief":"2-3句中文摘要，可保留必要英文术语缩写",'
+        '"tags":["3-6个中文短标签"],'
         '"score":0,'
-        '"interest_matches":["matched interest points from the user list"]}\n'
-        "Requirements:\n"
-        "- Focus on method, practical engineering value, and why it matters for LLM training/inference/infrastructure.\n"
-        "- score must be an integer between 0 and 100.\n"
-        "- score is the single final ranking score, based on fit to the user interests, engineering usefulness, and novelty.\n"
-        "- interest_matches must only contain exact or slightly normalized items from the user interest list.\n"
-        "- No markdown, no code fence, no extra keys.\n"
-        f"- Domain guess: {domain}\n"
-        f"- Heuristic tags: {hint_text}\n"
-        f"- User subscribed interests: {interest_text}\n\n"
-        f"Title: {paper.title}\n"
-        f"Abstract: {normalize(paper.summary) or 'N/A'}\n"
+        '"interest_matches":["从用户兴趣列表中匹配到的中文项"]}\n'
+        "要求：\n"
+        "- 必须使用中文输出 brief/tags/interest_matches。\n"
+        "- 重点说明方法、工程价值、对大模型训练/推理/基础设施的意义。\n"
+        "- score 必须是 0 到 100 的整数。\n"
+        "- score 是最终统一排序分，综合兴趣匹配度、工程实用性、创新性。\n"
+        "- interest_matches 只能从用户兴趣列表中选择原词或轻微归一化表达。\n"
+        "- 不要 Markdown，不要代码块，不要解释文本，只返回 JSON。\n"
+        f"- 规则侧预测领域: {domain}\n"
+        f"- 规则侧关键词: {hint_text}\n"
+        f"- 用户兴趣列表: {interest_text}\n\n"
+        f"标题: {paper.title}\n"
+        f"摘要: {normalize(paper.summary) or 'N/A'}\n"
     )
 
 
@@ -459,8 +577,7 @@ def call_qwen_brief(
             {
                 "role": "system",
                 "content": (
-                    "You are an expert research assistant for large-model engineering. "
-                    "You read arXiv abstracts and produce concise, practical paper briefs, tags, and a single final score."
+                    "你是大模型工程研究助手。必须仅返回合法 JSON，且 brief/tags/interest_matches 必须为中文。"
                 ),
             },
             {"role": "user", "content": build_qwen_brief_prompt(paper, meta, interest_topics)},
@@ -493,7 +610,7 @@ def call_qwen_brief(
     interest_matches = _normalize_interest_matches(parsed.get("interest_matches"))
     if not brief:
         brief = normalize(str(content))
-    return normalize_llm_brief_result({
+    result = normalize_llm_brief_result({
         "brief": brief[:600],
         "tags": tags,
         "score": parsed.get("score", parsed.get("recommendation_score", 0)),
@@ -501,7 +618,12 @@ def call_qwen_brief(
         "model": model,
         "source": "qwen",
         "error": None,
-    })
+    }, fallback_score=int(meta.get("heuristic_score", 0)))
+    return ensure_chinese_llm_brief_result(
+        result,
+        meta,
+        fallback_score=int(meta.get("heuristic_score", 0)),
+    )
 
 
 def attach_llm_briefs(
@@ -537,7 +659,15 @@ def attach_llm_briefs(
             continue
         cached = cache.get(paper.paper_id)
         if cached and ("score" in cached or "recommendation_score" in cached) and "interest_matches" in cached:
-            meta["llm_brief"] = normalize_llm_brief_result(cached, fallback_score=int(meta.get("heuristic_score", 0)))
+            cached_result = ensure_chinese_llm_brief_result(
+                cached,
+                meta,
+                fallback_score=int(meta.get("heuristic_score", 0)),
+            )
+            meta["llm_brief"] = cached_result
+            if cached_result != cached:
+                cache[paper.paper_id] = cached_result
+                updated = True
             logger.info("llm_brief_cache_hit id=%s", paper.paper_id)
             continue
         pending.append((idx, paper, meta))
@@ -582,7 +712,11 @@ def attach_llm_briefs(
                 }, fallback_score=int(meta.get("heuristic_score", 0)))
             future_results.append((idx, paper, meta, result))
         for idx, paper, meta, result in future_results:
-            result = normalize_llm_brief_result(result, fallback_score=int(meta.get("heuristic_score", 0)))
+            result = ensure_chinese_llm_brief_result(
+                result,
+                meta,
+                fallback_score=int(meta.get("heuristic_score", 0)),
+            )
             meta["llm_brief"] = result
             cache[paper.paper_id] = result
             updated = True
@@ -615,7 +749,11 @@ def attach_llm_briefs(
                         "source": "qwen",
                         "error": str(exc),
                     }, fallback_score=int(meta.get("heuristic_score", 0)))
-                result = normalize_llm_brief_result(result, fallback_score=int(meta.get("heuristic_score", 0)))
+                result = ensure_chinese_llm_brief_result(
+                    result,
+                    meta,
+                    fallback_score=int(meta.get("heuristic_score", 0)),
+                )
                 meta["llm_brief"] = result
                 cache[paper.paper_id] = result
                 updated = True
@@ -648,6 +786,206 @@ def save_author_cache(path: Path, cache: dict) -> None:
     path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def normalize_text_list(values: Any, max_items: int | None = None) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    out: list[str] = []
+    for raw in values:
+        txt = normalize(str(raw))
+        if not txt:
+            continue
+        out.append(txt)
+    deduped = list(dict.fromkeys(out))
+    if max_items is None:
+        return deduped
+    return deduped[:max_items]
+
+
+def registrable_domain(domain: str) -> str:
+    labels = [label for label in str(domain).strip().lower().split(".") if label]
+    if len(labels) <= 2:
+        return ".".join(labels)
+    suffix2 = ".".join(labels[-2:])
+    if suffix2 in MULTI_PART_PUBLIC_SUFFIXES and len(labels) >= 3:
+        return ".".join(labels[-3:])
+    return suffix2
+
+
+def infer_organization_domains_from_emails(emails: list[str]) -> list[str]:
+    domains: list[str] = []
+    for email in emails:
+        if "@" not in email:
+            continue
+        raw_domain = email.rsplit("@", 1)[-1].strip().lower()
+        if not raw_domain:
+            continue
+        domain = registrable_domain(raw_domain)
+        if not domain:
+            continue
+        if domain in PERSONAL_EMAIL_DOMAINS:
+            domains.append(f"个人邮箱域名({domain})")
+        else:
+            domains.append(domain)
+    return list(dict.fromkeys(domains))[:10]
+
+
+def extract_author_institutions(html_text: str) -> list[str]:
+    institution_meta_pattern = re.compile(
+        r'<meta\s+name=["\']citation_author_institution["\']\s+content=["\'](.*?)["\']',
+        re.IGNORECASE,
+    )
+    institutions = [normalize(unescape(x)) for x in institution_meta_pattern.findall(html_text)]
+    return [item for item in list(dict.fromkeys(institutions)) if item][:10]
+
+
+def build_organization_hints(affiliations: list[str], email_domains: list[str]) -> list[str]:
+    return list(dict.fromkeys(affiliations + email_domains))[:12]
+
+
+def normalize_author_profile(profile: dict[str, Any], fallback_authors: list[str]) -> dict[str, Any]:
+    data = dict(profile or {})
+    authors = normalize_text_list(data.get("authors"), max_items=20) or normalize_text_list(fallback_authors, max_items=20)
+    emails = extract_emails("\n".join(normalize_text_list(data.get("emails"), max_items=20)))[:12]
+    hints = data.get("organization_hints", {}) if isinstance(data.get("organization_hints"), dict) else {}
+    affiliations = normalize_text_list(hints.get("affiliations"), max_items=10)
+    email_domains = normalize_text_list(hints.get("email_domains"), max_items=10)
+    llm_inferred = bool(hints.get("llm_inferred", False))
+    if not email_domains:
+        email_domains = infer_organization_domains_from_emails(emails)
+    organizations = normalize_text_list(data.get("organizations"), max_items=12)
+    if not organizations:
+        organizations = build_organization_hints(affiliations, email_domains)
+    organization_source = normalize(str(data.get("organization_source", "")))
+    if not organization_source:
+        organization_source = "qwen" if llm_inferred else "heuristic"
+    organization_reason = normalize(str(data.get("organization_reason", "")))[:400]
+    organization_error = data.get("organization_error")
+    return {
+        "authors": authors,
+        "emails": emails,
+        "organizations": organizations,
+        "organization_hints": {
+            "affiliations": affiliations,
+            "email_domains": email_domains,
+            "llm_inferred": llm_inferred,
+        },
+        "organization_source": organization_source,
+        "organization_reason": organization_reason,
+        "organization_error": organization_error,
+        "source": data.get("source"),
+        "error": data.get("error"),
+    }
+
+
+def normalize_qwen_organization_result(result: dict[str, Any]) -> dict[str, Any]:
+    data = dict(result or {})
+    raw_organizations = data.get("organizations")
+    if isinstance(raw_organizations, str):
+        raw_organizations = re.split(r"[,/\n|;]+", raw_organizations)
+    raw_evidence = data.get("evidence")
+    if isinstance(raw_evidence, str):
+        raw_evidence = re.split(r"[,/\n|;]+", raw_evidence)
+    organizations = normalize_text_list(raw_organizations, max_items=12)
+    evidence = normalize_text_list(raw_evidence, max_items=10)
+    reason = normalize(str(data.get("reason", "")))[:300]
+    return {
+        "organizations": organizations,
+        "evidence": evidence,
+        "reason": reason,
+    }
+
+
+def build_qwen_organization_prompt(
+    paper: Paper,
+    authors: list[str],
+    emails: list[str],
+    affiliations: list[str],
+    email_domains: list[str],
+    heuristic_organizations: list[str],
+) -> str:
+    authors_text = ", ".join(authors[:12]) if authors else "N/A"
+    emails_text = ", ".join(emails[:12]) if emails else "N/A"
+    affiliations_text = "; ".join(affiliations[:10]) if affiliations else "N/A"
+    domains_text = ", ".join(email_domains[:10]) if email_domains else "N/A"
+    heuristics_text = "; ".join(heuristic_organizations[:12]) if heuristic_organizations else "N/A"
+    return (
+        "请根据作者信息推断论文相关组织（高校、公司、研究院、实验室）。\n"
+        "只返回严格 JSON，不要 markdown，不要解释文本。\n"
+        "schema:\n"
+        '{"organizations":["组织全称，优先中文或官方英文名"],'
+        '"evidence":["证据短语"],'
+        '"reason":"不超过80字的中文说明"}\n'
+        "要求：\n"
+        "- organizations 只保留最可信的 1-6 个组织。\n"
+        "- 若只有个人邮箱且无机构证据，可返回邮箱域名对应描述。\n"
+        "- 不要输出个人姓名。\n\n"
+        f"论文标题: {paper.title}\n"
+        f"作者: {authors_text}\n"
+        f"邮箱: {emails_text}\n"
+        f"页面机构字段(citation_author_institution): {affiliations_text}\n"
+        f"邮箱域名候选: {domains_text}\n"
+        f"规则候选组织: {heuristics_text}\n"
+    )
+
+
+def call_qwen_organization_analysis(
+    paper: Paper,
+    profile: dict[str, Any],
+    api_key: str,
+    base_url: str,
+    model: str,
+    timeout: int,
+) -> dict[str, Any]:
+    endpoint = base_url.rstrip("/") + "/chat/completions"
+    hints = profile.get("organization_hints", {}) if isinstance(profile.get("organization_hints"), dict) else {}
+    prompt = build_qwen_organization_prompt(
+        paper=paper,
+        authors=normalize_text_list(profile.get("authors"), max_items=20),
+        emails=normalize_text_list(profile.get("emails"), max_items=20),
+        affiliations=normalize_text_list(hints.get("affiliations"), max_items=10),
+        email_domains=normalize_text_list(hints.get("email_domains"), max_items=10),
+        heuristic_organizations=normalize_text_list(profile.get("organizations"), max_items=12),
+    )
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": "你是学术作者组织识别助手。必须仅返回合法 JSON。",
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.0,
+        "stream": False,
+        "max_tokens": 260,
+    }
+    req = urllib.request.Request(
+        endpoint,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "paperrss-assistant/1.0",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        raw = json.loads(response.read().decode("utf-8", errors="ignore"))
+    content = raw.get("choices", [{}])[0].get("message", {}).get("content", "")
+    parsed = _extract_json_object(content)
+    normalized = normalize_qwen_organization_result(parsed)
+    if not normalized["organizations"]:
+        normalized["organizations"] = normalize_text_list(profile.get("organizations"), max_items=12)
+    return {
+        "organizations": normalized["organizations"],
+        "evidence": normalized["evidence"],
+        "reason": normalized["reason"],
+        "model": model,
+        "source": "qwen",
+        "error": None,
+    }
+
+
 def attach_author_profiles(
     ranked_rows: list[tuple[Paper, dict]],
     enabled: bool,
@@ -655,6 +993,12 @@ def attach_author_profiles(
     max_papers: int,
     timeout: int,
     workers: int,
+    organization_llm_enabled: bool = False,
+    organization_llm_api_key: str = "",
+    organization_llm_base_url: str = QWEN_COMPAT_BASE_URL,
+    organization_llm_model: str = "qwen-long",
+    organization_llm_timeout: int = 20,
+    organization_llm_workers: int = 2,
 ) -> None:
     if not enabled or not ranked_rows:
         return
@@ -664,17 +1008,28 @@ def attach_author_profiles(
     pending: list[tuple[int, Paper, dict]] = []
     for idx, (paper, meta) in enumerate(ranked_rows, start=1):
         if idx > max_papers:
-            meta["author_profile"] = {
+            meta["author_profile"] = normalize_author_profile({
                 "authors": paper.authors,
                 "emails": [],
+                "organizations": [],
+                "organization_hints": {
+                    "affiliations": [],
+                    "email_domains": [],
+                    "llm_inferred": False,
+                },
+                "organization_source": "heuristic",
                 "source": None,
                 "error": f"skipped_by_limit(max_papers={max_papers})",
-            }
+            }, fallback_authors=paper.authors)
             logger.info("author_profile_skipped id=%s reason=limit rank=%s", paper.paper_id, idx)
             continue
         cached = cache.get(paper.paper_id)
         if cached:
-            meta["author_profile"] = cached
+            normalized_cached = normalize_author_profile(cached, fallback_authors=paper.authors)
+            meta["author_profile"] = normalized_cached
+            if normalized_cached != cached:
+                cache[paper.paper_id] = normalized_cached
+                updated = True
             logger.info("author_profile_cache_hit id=%s", paper.paper_id)
             continue
         pending.append((idx, paper, meta))
@@ -702,24 +1057,131 @@ def attach_author_profiles(
                 try:
                     profile = future.result()
                 except Exception as exc:  # noqa: BLE001
-                    profile = {
+                    profile = normalize_author_profile({
                         "authors": paper.authors,
                         "emails": [],
+                        "organizations": [],
+                        "organization_hints": {
+                            "affiliations": [],
+                            "email_domains": [],
+                            "llm_inferred": False,
+                        },
+                        "organization_source": "heuristic",
                         "source": None,
                         "error": str(exc),
-                    }
+                    }, fallback_authors=paper.authors)
+                profile = normalize_author_profile(profile, fallback_authors=paper.authors)
                 meta["author_profile"] = profile
                 cache[paper.paper_id] = profile
                 updated = True
                 logger.info(
-                    "author_profile_fetched id=%s rank=%s emails=%s source=%s err=%s",
+                    "author_profile_fetched id=%s rank=%s emails=%s organizations=%s source=%s err=%s",
                     paper.paper_id,
                     idx,
                     profile.get("emails", []),
+                    profile.get("organizations", []),
                     profile.get("source"),
                     profile.get("error"),
                 )
         logger.info("author_profile_stage_done pending=%s", len(pending))
+
+    if organization_llm_enabled and organization_llm_api_key:
+        org_pending: list[tuple[int, Paper, dict, dict[str, Any]]] = []
+        for idx, (paper, meta) in enumerate(ranked_rows, start=1):
+            if idx > max_papers:
+                continue
+            profile = normalize_author_profile(meta.get("author_profile", {}), fallback_authors=paper.authors)
+            meta["author_profile"] = profile
+            if (
+                profile.get("organization_source") == "qwen"
+                and bool(profile.get("organization_hints", {}).get("llm_inferred"))
+                and bool(profile.get("organizations"))
+            ):
+                continue
+            org_pending.append((idx, paper, meta, profile))
+
+        if org_pending:
+            logger.info(
+                "author_org_llm_stage_start pending=%s workers=%s timeout=%s model=%s",
+                len(org_pending),
+                max(1, organization_llm_workers),
+                organization_llm_timeout,
+                organization_llm_model,
+            )
+
+            def _run_org_llm(paper: Paper, profile: dict[str, Any]) -> dict[str, Any]:
+                return call_qwen_organization_analysis(
+                    paper=paper,
+                    profile=profile,
+                    api_key=organization_llm_api_key,
+                    base_url=organization_llm_base_url,
+                    model=organization_llm_model,
+                    timeout=organization_llm_timeout,
+                )
+
+            if organization_llm_workers <= 1:
+                llm_results: list[tuple[int, Paper, dict, dict[str, Any], dict[str, Any]]] = []
+                for idx, paper, meta, profile in org_pending:
+                    logger.info("author_org_llm_request_start id=%s rank=%s", paper.paper_id, idx)
+                    try:
+                        result = _run_org_llm(paper, profile)
+                    except Exception as exc:  # noqa: BLE001
+                        result = {
+                            "organizations": profile.get("organizations", []),
+                            "evidence": [],
+                            "reason": "",
+                            "model": organization_llm_model,
+                            "source": "qwen",
+                            "error": str(exc),
+                        }
+                    llm_results.append((idx, paper, meta, profile, result))
+            else:
+                llm_results = []
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, organization_llm_workers)) as pool:
+                    future_map: dict[concurrent.futures.Future[dict[str, Any]], tuple[int, Paper, dict, dict[str, Any]]] = {}
+                    for idx, paper, meta, profile in org_pending:
+                        logger.info("author_org_llm_request_start id=%s rank=%s", paper.paper_id, idx)
+                        future_map[pool.submit(_run_org_llm, paper, profile)] = (idx, paper, meta, profile)
+                    for future in concurrent.futures.as_completed(future_map):
+                        idx, paper, meta, profile = future_map[future]
+                        try:
+                            result = future.result()
+                        except Exception as exc:  # noqa: BLE001
+                            result = {
+                                "organizations": profile.get("organizations", []),
+                                "evidence": [],
+                                "reason": "",
+                                "model": organization_llm_model,
+                                "source": "qwen",
+                                "error": str(exc),
+                            }
+                        llm_results.append((idx, paper, meta, profile, result))
+
+            for idx, paper, meta, profile, result in llm_results:
+                llm_orgs = normalize_text_list(result.get("organizations"), max_items=12)
+                final_orgs = llm_orgs or normalize_text_list(profile.get("organizations"), max_items=12)
+                merged_hints = dict(profile.get("organization_hints", {}))
+                merged_hints["llm_inferred"] = bool(llm_orgs)
+                merged_profile = normalize_author_profile({
+                    **profile,
+                    "organizations": final_orgs,
+                    "organization_hints": merged_hints,
+                    "organization_source": "qwen" if llm_orgs else profile.get("organization_source", "heuristic"),
+                    "organization_reason": normalize(str(result.get("reason", ""))),
+                    "organization_error": result.get("error"),
+                }, fallback_authors=paper.authors)
+                meta["author_profile"] = merged_profile
+                cache[paper.paper_id] = merged_profile
+                updated = True
+                logger.info(
+                    "author_org_llm_done id=%s rank=%s organizations=%s llm_used=%s err=%s",
+                    paper.paper_id,
+                    idx,
+                    merged_profile.get("organizations", []),
+                    bool(llm_orgs),
+                    result.get("error"),
+                )
+            logger.info("author_org_llm_stage_done pending=%s", len(org_pending))
 
     if updated:
         save_author_cache(cache_path, cache)
@@ -873,12 +1335,19 @@ def enrich_author_profile(paper: Paper, timeout: int = 8) -> dict[str, Any]:
             continue
 
     if not page:
-        return {
+        return normalize_author_profile({
             "authors": paper.authors,
             "emails": [],
+            "organizations": [],
+            "organization_hints": {
+                "affiliations": [],
+                "email_domains": [],
+                "llm_inferred": False,
+            },
+            "organization_source": "heuristic",
             "source": None,
             "error": last_err,
-        }
+        }, fallback_authors=paper.authors)
 
     author_meta_pattern = re.compile(
         r'<meta\s+name=["\']citation_author["\']\s+content=["\'](.*?)["\']',
@@ -886,12 +1355,23 @@ def enrich_author_profile(paper: Paper, timeout: int = 8) -> dict[str, Any]:
     )
     html_authors = [unescape(x.strip()) for x in author_meta_pattern.findall(page) if x.strip()]
     emails = extract_emails(page)
-    return {
+    affiliations = extract_author_institutions(page)
+    email_domains = infer_organization_domains_from_emails(emails)
+    organizations = build_organization_hints(affiliations, email_domains)
+    return normalize_author_profile({
         "authors": html_authors or paper.authors,
         "emails": emails[:12],
+        "organizations": organizations,
+        "organization_hints": {
+            "affiliations": affiliations,
+            "email_domains": email_domains,
+            "llm_inferred": False,
+        },
+        "organization_source": "heuristic",
+        "organization_reason": "由 arXiv affiliation 字段与邮箱域名规则推断",
         "source": source_url,
         "error": None,
-    }
+    }, fallback_authors=paper.authors)
 
 
 def render_report(
@@ -899,6 +1379,7 @@ def render_report(
     run_at: datetime,
     new_total: int,
     ranked_rows: list[tuple[Paper, dict]],
+    report_date: str | None = None,
 ) -> None:
     relevant_rows = [row for row in ranked_rows if row[1]["relevant"]]
     top_picks = select_daily_top_picks(ranked_rows, limit=6)
@@ -910,7 +1391,8 @@ def render_report(
         keyword_counter.update(meta["llm_hits"])
 
     lines: list[str] = []
-    lines.append(f"# arXiv Daily LLM Radar - {run_at.strftime('%Y-%m-%d')}")
+    display_date = str(report_date or run_at.strftime("%Y-%m-%d"))
+    lines.append(f"# arXiv Daily LLM Radar - {display_date}")
     lines.append("")
     lines.append(f"- Run time (UTC): {run_at.strftime('%Y-%m-%d %H:%M:%S')} UTC")
     lines.append(f"- New papers scanned: {new_total}")
@@ -955,6 +1437,8 @@ def render_report(
             author_profile = meta.get("author_profile", {})
             authors = author_profile.get("authors") or paper.authors
             emails = author_profile.get("emails") or []
+            organizations = author_profile.get("organizations") or []
+            org_reason = normalize(str(author_profile.get("organization_reason", "")))
             authors_text = ", ".join(authors[:6]) if authors else "N/A"
             if len(authors) > 6:
                 authors_text += ", et al."
@@ -967,6 +1451,10 @@ def render_report(
             lines.append(f"- Authors: {authors_text}")
             if emails:
                 lines.append(f"- Author emails (from HTML): {', '.join(emails[:5])}")
+            if organizations:
+                lines.append(f"- Organizations: {', '.join(organizations[:6])}")
+                if org_reason:
+                    lines.append(f"- Organization analysis note: {org_reason}")
             lines.append(f"- Brief: {brief['brief']}")
             lines.append(f"- Tags: {brief['tags']}")
             lines.append(f"- Interest matches: {brief['interest_matches']}")
@@ -992,17 +1480,31 @@ def truncate_for_slack(text: str, max_len: int = 700) -> str:
     return text[: max_len - 1].rstrip() + "…"
 
 
+def split_slack_detail_and_tail_rows(
+    ranked_rows: list[tuple[Paper, dict]],
+    detail_limit: int = 10,
+) -> tuple[list[tuple[Paper, dict]], list[tuple[Paper, dict]]]:
+    limit = max(0, int(detail_limit))
+    if len(ranked_rows) <= limit:
+        return ranked_rows, []
+    return ranked_rows[:limit], ranked_rows[limit:]
+
+
 def build_slack_messages(
     run_at: datetime,
     new_total: int,
     ranked_rows: list[tuple[Paper, dict]],
     report_path: Path,
-) -> list[dict[str, Any]]:
+    report_date: str | None = None,
+    detail_limit: int = 10,
+) -> tuple[list[dict[str, Any]], dict[int, list[str]]]:
     relevant_rows = [row for row in ranked_rows if row[1]["relevant"]]
-    top_picks = select_daily_top_picks(ranked_rows, limit=5)
+    top_picks = select_daily_top_picks(ranked_rows, limit=10)
+    detail_rows, tail_rows = split_slack_detail_and_tail_rows(ranked_rows, detail_limit=detail_limit)
     domain_counter = Counter(row[1]["primary_domain"] for row in relevant_rows)
+    display_date = str(report_date or run_at.strftime("%Y-%m-%d"))
     header_text = (
-        f"arXiv Daily LLM Radar ({run_at.strftime('%Y-%m-%d')}) | "
+        f"arXiv Daily LLM Radar ({display_date}) | "
         f"new={new_total}, relevant={len(relevant_rows)}, total={len(ranked_rows)}"
     )
     overview_fields = [
@@ -1027,7 +1529,7 @@ def build_slack_messages(
                 {"type": "section", "fields": overview_fields},
                 {"type": "section", "text": {"type": "mrkdwn", "text": "No new papers in this run."}},
             ],
-        }]
+        }], {}
 
     top_pick_lines: list[str] = []
     for idx, (paper, meta) in enumerate(top_picks, start=1):
@@ -1036,7 +1538,12 @@ def build_slack_messages(
             f"{idx}. [{brief['score']}] <{paper.link}|{paper.title}>"
         )
 
-    # Daily mode: one overview + one top-picks summary + one message per paper.
+    # Daily mode: one overview + top-N details + one compact remainder message.
+    delivery_mode = (
+        "Delivery mode: top-picks summary first, then one paper per message"
+        if not tail_rows
+        else "Delivery mode: top 10 detail cards first, then one compact thread-style remainder message"
+    )
     messages: list[dict[str, Any]] = [{
         "text": header_text,
         "blocks": [
@@ -1049,15 +1556,17 @@ def build_slack_messages(
                     "text": "*Today’s Top Picks*\n" + ("\n".join(top_pick_lines) if top_pick_lines else "No picks."),
                 },
             },
-            {"type": "context", "elements": [{"type": "mrkdwn", "text": "Delivery mode: top-picks summary first, then one paper per message"}]},
+            {"type": "context", "elements": [{"type": "mrkdwn", "text": delivery_mode}]},
         ],
     }]
+    message_paper_ids: dict[int, list[str]] = {}
     total = len(ranked_rows)
-    for i, (paper, meta) in enumerate(ranked_rows, start=1):
+    for i, (paper, meta) in enumerate(detail_rows, start=1):
         brief = build_paper_brief(paper, meta)
         author_profile = meta.get("author_profile", {})
         authors = author_profile.get("authors") or paper.authors
         emails = author_profile.get("emails") or []
+        organizations = author_profile.get("organizations") or []
         author_text = ", ".join(authors[:3]) if authors else "N/A"
         if len(authors) > 3:
             author_text += ", et al."
@@ -1088,6 +1597,16 @@ def build_slack_messages(
                         "text": f"*Interest matches*\n{brief['interest_matches']}",
                     },
                 },
+                *([{
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": (
+                            "*Organizations*\n"
+                            + truncate_for_slack(", ".join(organizations[:5]), max_len=300)
+                        ),
+                    },
+                }] if organizations else []),
                 {
                     "type": "section",
                     "text": {
@@ -1114,7 +1633,35 @@ def build_slack_messages(
                 },
             ],
         })
-    return messages
+        message_paper_ids[len(messages)] = [paper.paper_id]
+
+    if tail_rows:
+        tail_lines: list[str] = []
+        for i, (paper, meta) in enumerate(tail_rows, start=len(detail_rows) + 1):
+            brief = build_paper_brief(paper, meta)
+            one_line_brief = truncate_for_slack(brief["brief"].replace("\n", " "), max_len=110)
+            tail_lines.append(
+                f"*{i}. [{brief['score']}] <{paper.link}|{paper.title}>*\n"
+                f"   摘要: {one_line_brief}"
+            )
+        messages.append({
+            "text": f"Thread: remaining {len(tail_rows)} papers",
+            "blocks": [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": (
+                            f"*Thread: Remaining {len(tail_rows)} Papers (Compact)*\n"
+                            + "\n\n".join(tail_lines)
+                        ),
+                    },
+                },
+            ],
+        })
+        message_paper_ids[len(messages)] = [paper.paper_id for paper, _ in tail_rows]
+
+    return messages, message_paper_ids
 
 
 def split_text_chunks(text: str, max_chars: int = 3500) -> list[str]:
@@ -1288,6 +1835,9 @@ def run(args: argparse.Namespace) -> int:
             meta["heuristic_score"],
             meta.get("is_inference_accel", False),
         )
+    llm_brief_api_key = str(config.get("llm_brief_api_key", "")).strip()
+    llm_brief_base_url = str(config.get("llm_brief_base_url", QWEN_COMPAT_BASE_URL)).strip() or QWEN_COMPAT_BASE_URL
+    llm_brief_model = str(config.get("llm_brief_model", "qwen-long")).strip() or "qwen-long"
     author_enrich = (
         args.author_enrich
         if args.author_enrich is not None
@@ -1297,6 +1847,14 @@ def run(args: argparse.Namespace) -> int:
     author_enrich_max_papers = int(config.get("author_enrich_max_papers", 60))
     author_enrich_timeout = int(config.get("author_enrich_timeout_seconds", 8))
     author_enrich_workers = int(config.get("author_enrich_workers", 8))
+    author_org_llm_enabled = parse_bool(config.get("author_org_llm_enabled", True), default=True)
+    author_org_llm_api_key = str(config.get("author_org_llm_api_key", llm_brief_api_key)).strip() or llm_brief_api_key
+    author_org_llm_base_url = (
+        str(config.get("author_org_llm_base_url", llm_brief_base_url)).strip() or llm_brief_base_url
+    )
+    author_org_llm_model = str(config.get("author_org_llm_model", llm_brief_model)).strip() or llm_brief_model
+    author_org_llm_timeout = int(config.get("author_org_llm_timeout_seconds", 20))
+    author_org_llm_workers = int(config.get("author_org_llm_workers", 2))
     attach_author_profiles(
         ranked_rows,
         author_enrich,
@@ -1304,14 +1862,23 @@ def run(args: argparse.Namespace) -> int:
         max_papers=author_enrich_max_papers,
         timeout=author_enrich_timeout,
         workers=author_enrich_workers,
+        organization_llm_enabled=author_org_llm_enabled,
+        organization_llm_api_key=author_org_llm_api_key,
+        organization_llm_base_url=author_org_llm_base_url,
+        organization_llm_model=author_org_llm_model,
+        organization_llm_timeout=author_org_llm_timeout,
+        organization_llm_workers=author_org_llm_workers,
     )
     if author_enrich and ranked_rows:
         with_email = sum(1 for _, meta in ranked_rows if (meta.get("author_profile", {}).get("emails") or []))
+        with_org = sum(1 for _, meta in ranked_rows if (meta.get("author_profile", {}).get("organizations") or []))
         logger.info(
-            "author_email_coverage papers=%s with_email=%s ratio=%.3f",
+            "author_profile_coverage papers=%s with_email=%s email_ratio=%.3f with_org=%s org_ratio=%.3f",
             len(ranked_rows),
             with_email,
             with_email / max(len(ranked_rows), 1),
+            with_org,
+            with_org / max(len(ranked_rows), 1),
         )
     llm_brief_enabled = (
         getattr(args, "llm_brief_enabled", None)
@@ -1328,9 +1895,6 @@ def run(args: argparse.Namespace) -> int:
             "distributed training",
             "serving system",
         ]
-    llm_brief_api_key = str(config.get("llm_brief_api_key", "")).strip()
-    llm_brief_base_url = str(config.get("llm_brief_base_url", QWEN_COMPAT_BASE_URL)).strip() or QWEN_COMPAT_BASE_URL
-    llm_brief_model = str(config.get("llm_brief_model", "qwen-long")).strip() or "qwen-long"
     llm_brief_cache_path = Path(config.get("llm_brief_cache", "storage/data/llm_brief_cache.json"))
     llm_brief_max_papers = int(config.get("llm_brief_max_papers", 250))
     llm_brief_timeout = int(config.get("llm_brief_timeout_seconds", 20))
@@ -1389,90 +1953,133 @@ def run(args: argparse.Namespace) -> int:
     force_push_today = force_push_date == today_str
     force_push = bool(args.force_push) or force_push_today
 
-    report_path = output_dir / f"{now.strftime('%Y-%m-%d')}.md"
-    report_exists = report_path.exists()
-    # Preserve today's existing report when there is no new incremental data.
-    preserve_existing_report = len(new_rows) == 0 and report_exists
-    force_push_existing_report = force_push and preserve_existing_report
-    logger.info(
-        "report_write_decision path=%s exists=%s new_rows=%s preserve_existing=%s force_push_existing=%s",
-        report_path,
-        report_exists,
-        len(new_rows),
-        preserve_existing_report,
-        force_push_existing_report,
+    report_buckets = build_report_buckets(
+        now=now,
+        last_run=last_run,
+        new_rows=new_rows,
+        ranked_rows=ranked_rows,
+        sort_priority=sort_priority,
     )
-    if not preserve_existing_report:
-        render_report(report_path, now, len(new_rows), ranked_rows)
+    if len(report_buckets) > 1:
+        logger.info(
+            "backfill_split_enabled buckets=%s range=%s",
+            len(report_buckets),
+            ",".join(day_key for day_key, _, _ in report_buckets),
+        )
 
-    # Push dedupe: avoid re-sending already pushed papers on restart/redeploy.
-    ranked_rows_for_push = ranked_rows
-    if not force_push:
-        ranked_rows_for_push = [row for row in ranked_rows if row[0].paper_id not in pushed_paper_ids]
-    dedup_filtered = len(ranked_rows) - len(ranked_rows_for_push)
-    logger.info(
-        "push_dedupe total_ranked=%s filtered_already_pushed=%s remaining=%s",
-        len(ranked_rows),
-        dedup_filtered,
-        len(ranked_rows_for_push),
-    )
-
-    should_send_slack = bool(webhook_url) and (
-        force_push
-        or slack_when == "any"
-        or (slack_when == "relevant" and len(relevant_rows) > 0)
-    )
-    if not force_push and len(ranked_rows_for_push) == 0:
-        should_send_slack = False
-        logger.info("push_dedupe_skip reason=no_new_rows_after_dedupe")
-    if not force_push and today_str in pushed_report_dates and len(ranked_rows_for_push) == 0:
-        should_send_slack = False
-        logger.info("push_dedupe_skip reason=report_already_pushed_today date=%s", today_str)
-
-    if should_send_slack:
-        if force_push_existing_report:
-            slack_messages = build_slack_messages_from_report(report_path)
-        else:
-            slack_messages = build_slack_messages(now, len(new_rows), ranked_rows_for_push, report_path)
-        paper_id_by_message_index: dict[int, str] = {}
-        if not force_push_existing_report:
-            # Message index 1 is the overview message; paper cards start from index 2.
-            for i, (paper, _) in enumerate(ranked_rows_for_push, start=2):
-                paper_id_by_message_index[i] = paper.paper_id
-
-        def on_message_sent(idx: int, _msg: dict[str, Any]) -> None:
-            # Persist push state incrementally to survive mid-run failures/restarts.
-            pushed_report_dates.add(today_str)
-            paper_id = paper_id_by_message_index.get(idx)
-            if paper_id:
-                pushed_by_date.setdefault(today_str, set()).add(paper_id)
-                pushed_paper_ids.add(paper_id)
-            pruned = prune_pushed_by_date(pushed_by_date, today_str, push_state_retention_days)
-            save_push_state(
-                push_state_path,
-                {k: sorted(v) for k, v in sorted(pruned.items())},
-                sorted(pushed_report_dates)[-365:],
+    any_force_push_existing_report = False
+    report_paths: list[Path] = []
+    slack_status_by_day: list[str] = []
+    for bucket_index, (report_date_key, new_rows_bucket, ranked_rows_bucket) in enumerate(report_buckets, start=1):
+        report_path = output_dir / f"{report_date_key}.md"
+        report_paths.append(report_path)
+        report_exists = report_path.exists()
+        preserve_existing_report = len(new_rows_bucket) == 0 and report_exists
+        force_push_existing_report = force_push and preserve_existing_report
+        any_force_push_existing_report = any_force_push_existing_report or force_push_existing_report
+        logger.info(
+            "report_write_decision path=%s report_date=%s bucket=%s/%s exists=%s new_rows=%s preserve_existing=%s force_push_existing=%s",
+            report_path,
+            report_date_key,
+            bucket_index,
+            len(report_buckets),
+            report_exists,
+            len(new_rows_bucket),
+            preserve_existing_report,
+            force_push_existing_report,
+        )
+        if not preserve_existing_report:
+            render_report(
+                report_path,
+                now,
+                len(new_rows_bucket),
+                ranked_rows_bucket,
+                report_date=report_date_key,
             )
-            logger.info(
-                "push_state_incremental_saved msg_index=%s paper_id=%s report_date=%s",
-                idx,
-                paper_id,
-                today_str,
-            )
-        try:
-            sent_count, fail_count, first_error = post_to_slack(
-                webhook_url,
-                slack_messages,
-                send_interval_seconds=float(config.get("slack_send_interval_seconds", 1.1)),
-                max_retries=int(config.get("slack_max_retries", 4)),
-                on_message_sent=on_message_sent,
-            )
-            if fail_count == 0:
-                slack_status = f"sent({sent_count})"
+
+        ranked_rows_for_push = ranked_rows_bucket
+        if not force_push:
+            ranked_rows_for_push = [row for row in ranked_rows_bucket if row[0].paper_id not in pushed_paper_ids]
+        dedup_filtered = len(ranked_rows_bucket) - len(ranked_rows_for_push)
+        logger.info(
+            "push_dedupe report_date=%s total_ranked=%s filtered_already_pushed=%s remaining=%s",
+            report_date_key,
+            len(ranked_rows_bucket),
+            dedup_filtered,
+            len(ranked_rows_for_push),
+        )
+
+        relevant_rows_bucket = [row for row in ranked_rows_bucket if row[1]["relevant"]]
+        should_send_slack = bool(webhook_url) and (
+            force_push
+            or slack_when == "any"
+            or (slack_when == "relevant" and len(relevant_rows_bucket) > 0)
+        )
+        if not force_push and len(ranked_rows_for_push) == 0:
+            should_send_slack = False
+            logger.info("push_dedupe_skip reason=no_new_rows_after_dedupe report_date=%s", report_date_key)
+        if not force_push and report_date_key in pushed_report_dates and len(ranked_rows_for_push) == 0:
+            should_send_slack = False
+            logger.info("push_dedupe_skip reason=report_already_pushed date=%s", report_date_key)
+
+        day_slack_status = "skipped"
+        if should_send_slack:
+            slack_top_detail_limit = int(config.get("slack_top_detail_limit", 10))
+            if force_push_existing_report:
+                slack_messages = build_slack_messages_from_report(report_path)
+                paper_ids_by_message_index: dict[int, list[str]] = {}
             else:
-                slack_status = f"partial(sent={sent_count}, failed={fail_count}, first_error={first_error})"
-        except Exception as exc:  # noqa: BLE001
-            slack_status = f"failed ({exc})"
+                run_at_for_report = datetime.strptime(report_date_key, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                slack_messages, paper_ids_by_message_index = build_slack_messages(
+                    run_at_for_report,
+                    len(new_rows_bucket),
+                    ranked_rows_for_push,
+                    report_path,
+                    report_date=report_date_key,
+                    detail_limit=slack_top_detail_limit,
+                )
+
+            def on_message_sent(idx: int, _msg: dict[str, Any], report_date_key: str = report_date_key) -> None:
+                # Persist push state incrementally to survive mid-run failures/restarts.
+                pushed_report_dates.add(report_date_key)
+                paper_ids = paper_ids_by_message_index.get(idx, [])
+                for paper_id in paper_ids:
+                    pushed_by_date.setdefault(report_date_key, set()).add(paper_id)
+                    pushed_paper_ids.add(paper_id)
+                pruned = prune_pushed_by_date(pushed_by_date, today_str, push_state_retention_days)
+                save_push_state(
+                    push_state_path,
+                    {k: sorted(v) for k, v in sorted(pruned.items())},
+                    sorted(pushed_report_dates)[-365:],
+                )
+                logger.info(
+                    "push_state_incremental_saved msg_index=%s paper_ids=%s report_date=%s",
+                    idx,
+                    ",".join(paper_ids) if paper_ids else "",
+                    report_date_key,
+                )
+
+            try:
+                sent_count, fail_count, first_error = post_to_slack(
+                    webhook_url,
+                    slack_messages,
+                    send_interval_seconds=float(config.get("slack_send_interval_seconds", 1.1)),
+                    max_retries=int(config.get("slack_max_retries", 4)),
+                    on_message_sent=on_message_sent,
+                )
+                if fail_count == 0:
+                    day_slack_status = f"sent({sent_count})"
+                else:
+                    day_slack_status = f"partial(sent={sent_count}, failed={fail_count}, first_error={first_error})"
+            except Exception as exc:  # noqa: BLE001
+                day_slack_status = f"failed ({exc})"
+        slack_status_by_day.append(f"{report_date_key}:{day_slack_status}")
+
+    final_report_path = report_paths[-1] if report_paths else (output_dir / f"{today_str}.md")
+    if len(slack_status_by_day) == 1:
+        slack_status = slack_status_by_day[0].split(":", 1)[1]
+    elif slack_status_by_day:
+        slack_status = "; ".join(slack_status_by_day)
     else:
         slack_status = "skipped"
 
@@ -1493,16 +2100,12 @@ def run(args: argparse.Namespace) -> int:
         sorted(pushed_report_dates)[-365:],
     )
 
-    force_push_mode = (
-        "existing_report" if force_push_existing_report else
-        "on" if force_push else
-        "off"
-    )
+    force_push_mode = "existing_report" if any_force_push_existing_report else ("on" if force_push else "off")
     logger.info(
         "scan_completed new_scanned=%s relevant=%s report=%s state=%s subscription_store=%s push_state=%s slack=%s force_push_mode=%s sort_priority=%s author_enrich=%s max_author_papers=%s",
         len(new_rows),
         len(relevant_rows),
-        report_path,
+        final_report_path,
         state_path,
         subscription_store_path,
         push_state_path,
