@@ -61,5 +61,7 @@
   "weekly_llm_model": "qwen-long",
   "weekly_llm_timeout_seconds": 25,
   "weekly_llm_cache": "storage/data/weekly_llm_cache.json",
-  "cmd_reply_in_thread": true
+  "cmd_reply_in_thread": true,
+  "slack_push_workers": 4,
+  "slack_preserve_order": true
 }
