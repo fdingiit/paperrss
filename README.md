@@ -33,8 +33,13 @@ cp /Users/fd/Lab/paperrss/config.example.json /Users/fd/Lab/paperrss/storage/con
 - `slack_when`：`any` 或 `relevant`
 - `slack_send_interval_seconds`：推送间隔秒数（建议 `>=1`，避免限流）
 - `slack_max_retries`：单条消息失败重试次数
-- `slack_preserve_order`：是否按 ranking 顺序推送（默认 `true`，当前实现按序串行推送）
-- `sort_priority`：排序策略，默认 `inference_acceleration`（最高优先级：推理加速）
+- `sort_priority`：排序策略，默认 `inference_acceleration`（最高优先级：推理加速；其他可选：`balanced`、`recent`）
+- `force_push_date`：强制推送日期（格式 `YYYY-MM-DD`），匹配当天则忽略去重直接推送，默认空
+- `rss_categories`：订阅的 arXiv 分类列表，默认 `["cs.LG","cs.AI","cs.CL","cs.DC","stat.ML"]`
+- `rss_max_results`：单次 RSS 拉取最大结果数，默认 `250`
+- `rss_state`：已见论文 ID 的状态文件，默认 `storage/data/state.json`
+- `rss_output_dir`：日报输出目录，默认 `storage/reports`
+- `weekly_output_dir`：周报输出目录，默认 `storage/reports`
 - `classify_workers`：分类阶段并发 worker 数（默认 `8`）
 - `subscription_store`：订阅历史持久化（已见论文 ID，默认 `storage/data/subscriptions.json`）
 - `push_state`：推送去重持久化（已推论文/已推报告日期，默认 `storage/data/push_state.json`）
@@ -65,6 +70,9 @@ cp /Users/fd/Lab/paperrss/config.example.json /Users/fd/Lab/paperrss/storage/con
 - `slack_bot_token`：用于 ping/pong 的 Bot Token（`xoxb-...`）
 - `slack_app_token`：Socket Mode App-Level Token（`xapp-...`）
 - `slack_channel_id`：监听并回复的频道 ID（`C...`）
+- `ping_text` / `pong_text`：ping/pong 命令的触发词与回复词，默认 `ping` / `pong`
+- `ping_poll_interval_seconds`：命令轮询间隔秒数，默认 `10`
+- `ping_state`：命令轮询状态持久化，默认 `storage/data/healthcheck_state.json`
 - `cmd_reply_in_thread`：是否在线程内回复（默认 `true`）
 - `health_host` / `health_port`：health server 地址，默认 `127.0.0.1:8080`
 - `log_level` / `log_file`：日志级别与日志文件（daemon 会同时输出到终端和文件）

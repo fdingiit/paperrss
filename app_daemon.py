@@ -238,7 +238,10 @@ def save_weekly_llm_cache(path: Path, payload: dict[str, Any]) -> None:
 
 
 def parse_daily_report(report_path: Path) -> dict[str, Any]:
-    text = report_path.read_text(encoding="utf-8")
+    try:
+        text = report_path.read_text(encoding="utf-8")
+    except OSError:
+        return {"path": report_path, "date": report_path.stem, "new_scanned": 0, "relevant": 0, "entries": []}
     m_new = re.search(r"- New papers scanned: (\d+)", text)
     m_rel = re.search(r"- Relevant papers .*: (\d+)", text)
     new_scanned = int(m_new.group(1)) if m_new else 0
@@ -488,6 +491,8 @@ def build_weekly_report_markdown(
     weekly_report_path: Path,
     week_end_local: datetime,
     weekly_synthesis: dict[str, Any] | None = None,
+    *,
+    write: bool = True,
 ) -> dict[str, Any] | None:
     reports = collect_weekly_reports(report_dir, week_end_local)
     if not reports:
@@ -592,8 +597,9 @@ def build_weekly_report_markdown(
         if entry.get("link"):
             lines.append(f"- Link: {entry.get('link')}")
         lines.append("")
-    weekly_report_path.parent.mkdir(parents=True, exist_ok=True)
-    weekly_report_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    if write:
+        weekly_report_path.parent.mkdir(parents=True, exist_ok=True)
+        weekly_report_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
     return {
         "week_start": week_start_date.isoformat(),
         "week_end": week_end_date.isoformat(),
@@ -779,7 +785,7 @@ def weekly_report_loop(
         try:
             logger.info("weekly_scheduler_tick due_key=%s", due_key)
             weekly_report_path = weekly_report_dir / f"weekly-{due_key}.md"
-            summary = build_weekly_report_markdown(report_dir, weekly_report_path, now_local)
+            summary = build_weekly_report_markdown(report_dir, weekly_report_path, now_local, write=False)
             if summary is not None:
                 weekly_synthesis = attach_weekly_synthesis(summary, config, due_key)
                 summary = build_weekly_report_markdown(
